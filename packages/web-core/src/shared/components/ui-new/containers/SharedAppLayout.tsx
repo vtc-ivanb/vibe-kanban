@@ -22,8 +22,6 @@ import { AppBarUserPopoverContainer } from './AppBarUserPopoverContainer';
 import { useUserOrganizations } from '@/shared/hooks/useUserOrganizations';
 import { useOrganizationStore } from '@/shared/stores/useOrganizationStore';
 import { useAuth } from '@/shared/hooks/auth/useAuth';
-import { useDiscordOnlineCount } from '@/shared/hooks/useDiscordOnlineCount';
-import { useGitHubStars } from '@/shared/hooks/useGitHubStars';
 import { useUserSystem } from '@/shared/hooks/useUserSystem';
 import { useAppUpdateStore } from '@/shared/stores/useAppUpdateStore';
 import { useAppNavigation } from '@/shared/hooks/useAppNavigation';
@@ -68,8 +66,6 @@ export function SharedAppLayout() {
   const { appVersion } = useUserSystem();
   const updateVersion = useAppUpdateStore((s) => s.updateVersion);
   const restartForUpdate = useAppUpdateStore((s) => s.restart);
-  const { data: onlineCount } = useDiscordOnlineCount();
-  const { data: starCount } = useGitHubStars();
   const [isDrawerOpen, setIsDrawerOpen] = useState(false);
   const [isAppBarHovered, setIsAppBarHovered] = useState(false);
   const { hosts: remoteCloudHosts } = useRemoteCloudHostsAppBarModel();
@@ -360,8 +356,6 @@ export function SharedAppLayout() {
                   onOrgSelect={setSelectedOrgId}
                 />
               }
-              starCount={starCount}
-              onlineCount={onlineCount}
               appVersion={appVersion}
               updateVersion={updateVersion}
               onUpdateClick={restartForUpdate ?? undefined}

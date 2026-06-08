@@ -23,6 +23,7 @@ use utils::{
 };
 use uuid::Uuid;
 
+#[allow(dead_code)]
 const UPDATE_CHECK_INTERVAL: Duration = Duration::from_secs(60 * 60);
 
 #[cfg(target_os = "linux")]
@@ -250,20 +251,6 @@ fn main() {
                     }
                 });
 
-                // Check for updates in the background on startup and then
-                // periodically. We only *download* the update here —
-                // installing it (which replaces the app bundle on disk) is
-                // deferred until the user exits or triggers a restart.
-                // Installing while the app is running causes a code-signature
-                // mismatch on macOS, which makes NSOpenPanel (and other XPC
-                // services) return NULL and crash the app.
-                // See tauri-apps/tauri#13047.
-                let update_handle = app.handle().clone();
-                let pending_for_download = pending_for_setup.clone();
-                tauri::async_runtime::spawn(async move {
-                    run_periodic_update_checks(update_handle, pending_for_download).await;
-                });
-
                 // Listen for restart request from frontend (after update downloaded).
                 // Install the previously downloaded bytes *now*, then restart.
                 let restart_handle = app.handle().clone();
@@ -442,6 +429,7 @@ async fn install_pending_update(app: &tauri::AppHandle, pending: &Mutex<Option<V
     }
 }
 
+#[allow(dead_code)]
 async fn check_for_updates(app: tauri::AppHandle, pending_update: Arc<Mutex<Option<Vec<u8>>>>) {
     let has_pending_update = pending_update.lock().await.is_some();
     if has_pending_update {
@@ -502,6 +490,7 @@ async fn check_for_updates(app: tauri::AppHandle, pending_update: Arc<Mutex<Opti
     }
 }
 
+#[allow(dead_code)]
 async fn run_periodic_update_checks(
     app: tauri::AppHandle,
     pending_update: Arc<Mutex<Option<Vec<u8>>>>,

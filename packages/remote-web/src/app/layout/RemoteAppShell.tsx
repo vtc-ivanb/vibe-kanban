@@ -17,8 +17,6 @@ import { cn } from "@/shared/lib/utils";
 import { useUserOrganizations } from "@/shared/hooks/useUserOrganizations";
 import { useAuth } from "@/shared/hooks/auth/useAuth";
 import { useOrganizationStore } from "@/shared/stores/useOrganizationStore";
-import { useDiscordOnlineCount } from "@/shared/hooks/useDiscordOnlineCount";
-import { useGitHubStars } from "@/shared/hooks/useGitHubStars";
 import { AppBarNotificationBellContainer } from "@/pages/workspaces/AppBarNotificationBellContainer";
 import { SettingsDialog } from "@/shared/dialogs/settings/SettingsDialog";
 import { CommandBarDialog } from "@/shared/dialogs/command-bar/CommandBarDialog";
@@ -125,8 +123,6 @@ export function RemoteAppShell({ children }: RemoteAppShellProps) {
   const isLoadingProjects =
     isSignedIn && !!activeOrganizationId && projectsQuery.isLoading;
 
-  const { data: onlineCount } = useDiscordOnlineCount();
-  const { data: starCount } = useGitHubStars();
   const { hosts: relayHosts } = useRelayAppBarHosts(isSignedIn);
 
   const selectedOrgName =
@@ -285,8 +281,6 @@ export function RemoteAppShell({ children }: RemoteAppShellProps) {
                 onOrgSelect={setSelectedOrgId}
               />
             }
-            starCount={starCount}
-            onlineCount={onlineCount}
             githubIconPath={siGithub.path}
             discordIconPath={siDiscord.path}
           />
