@@ -105,7 +105,7 @@ impl Codex {
                         .await
                 }
                 CodexSlashCommand::Mcp => {
-                    self.handle_app_server_slash_command(current_dir, command, None, env)
+                    self.handle_app_server_slash_command(current_dir, command, session_id, env)
                         .await
                 }
                 CodexSlashCommand::Fast { .. } => {
@@ -178,7 +178,7 @@ impl Codex {
                             .await;
                     }
                     CodexSlashCommand::Mcp => {
-                        let message = fetch_mcp_status_message(&client).await?;
+                        let message = fetch_mcp_status_message(&client, session_id.clone()).await?;
                         log_event_raw(client.log_writer(), message).await?;
                         exit_signal_tx
                             .send_exit_signal(ExecutorExitResult::Success)
@@ -191,6 +191,7 @@ impl Codex {
                             .await
                             .ok()
                             .and_then(|r| r.config.service_tier)
+                            .and_then(|t| ServiceTier::from_request_value(&t))
                             .map(|t| matches!(t, ServiceTier::Fast))
                             .unwrap_or(false);
                         if status {
@@ -225,7 +226,7 @@ impl Codex {
                         // Fork current session with new tier if one is active
                         if let Some(old_thread_id) = session_id {
                             let service_tier = if want_fast {
-                                Some(Some(ServiceTier::Fast))
+                                Some(Some(ServiceTier::Fast.request_value().to_string()))
                             } else {
                                 Some(None)
                             };
@@ -400,7 +401,8 @@ async fn fetch_status_message(
     // Show fast mode
     let global_fast = config_resp
         .as_ref()
-        .and_then(|r| r.config.service_tier.as_ref())
+        .and_then(|r| r.config.service_tier.as_deref())
+        .and_then(ServiceTier::from_request_value)
         .map(|t| matches!(t, ServiceTier::Fast))
         .unwrap_or(false);
     if global_fast || session_fast {
@@ -596,11 +598,16 @@ async fn find_rollout_file(dir: &Path, session_id: &str) -> Option<PathBuf> {
     None
 }
 
-async fn fetch_mcp_status_message(client: &AppServerClient) -> Result<String, ExecutorError> {
+async fn fetch_mcp_status_message(
+    client: &AppServerClient,
+    thread_id: Option<String>,
+) -> Result<String, ExecutorError> {
     let mut cursor = None;
     let mut servers = Vec::new();
     loop {
-        let response = client.list_mcp_server_status(cursor).await?;
+        let response = client
+            .list_mcp_server_status(cursor, thread_id.clone())
+            .await?;
         servers.extend(response.data);
         cursor = response.next_cursor;
         if cursor.is_none() {

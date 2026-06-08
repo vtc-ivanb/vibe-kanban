@@ -223,6 +223,7 @@ impl AppServerClient {
     pub async fn list_mcp_server_status(
         &self,
         cursor: Option<String>,
+        thread_id: Option<String>,
     ) -> Result<ListMcpServerStatusResponse, ExecutorError> {
         let request = ClientRequest::McpServerStatusList {
             request_id: self.next_request_id(),
@@ -230,6 +231,7 @@ impl AppServerClient {
                 cursor,
                 limit: None,
                 detail: Some(McpServerStatusDetail::ToolsAndAuthOnly),
+                thread_id,
             },
         };
         self.send_request(request, "mcpServerStatus/list").await
@@ -431,7 +433,8 @@ impl AppServerClient {
             }
             ServerRequest::ChatgptAuthTokensRefresh { .. }
             | ServerRequest::McpServerElicitationRequest { .. }
-            | ServerRequest::PermissionsRequestApproval { .. } => {
+            | ServerRequest::PermissionsRequestApproval { .. }
+            | ServerRequest::AttestationGenerate { .. } => {
                 tracing::warn!("received unhandled v2 server request: {:?}", request);
                 let response = JSONRPCResponse {
                     id: request.id().clone(),
