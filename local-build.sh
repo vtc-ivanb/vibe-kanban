@@ -19,13 +19,17 @@ case "$ARCH" in
     ;;
 esac
 
-# Map OS names
+# Map OS names. Windows builds run under Git Bash / MSYS2, where `uname -s`
+# reports MINGW64_NT-*, MSYS_NT-*, or CYGWIN_NT-*.
 case "$OS" in
   linux)
     OS="linux"
     ;;
   darwin)
     OS="macos"
+    ;;
+  mingw*|msys*|cygwin*)
+    OS="windows"
     ;;
   *)
     echo "⚠️  Warning: Unknown OS $OS, using as-is"
@@ -34,6 +38,12 @@ esac
 
 PLATFORM="${OS}-${ARCH}"
 
+# Windows executables carry a .exe suffix; other platforms have none.
+EXE=""
+if [ "$OS" = "windows" ]; then
+  EXE=".exe"
+fi
+
 # Set CARGO_TARGET_DIR if not defined
 if [ -z "$CARGO_TARGET_DIR" ]; then
   CARGO_TARGET_DIR="target"
@@ -41,6 +51,38 @@ fi
 
 echo "🔍 Detected platform: $PLATFORM"
 echo "🔧 Using target directory: $CARGO_TARGET_DIR"
+
+# On Windows, bindgen (via libsqlite3-sys) needs libclang. Auto-detect a default
+# LLVM install if LIBCLANG_PATH isn't already set.
+if [ "$OS" = "windows" ] && [ -z "$LIBCLANG_PATH" ]; then
+  if [ -f "/c/Program Files/LLVM/bin/libclang.dll" ]; then
+    export LIBCLANG_PATH="/c/Program Files/LLVM/bin"
+    echo "🔧 Auto-set LIBCLANG_PATH=$LIBCLANG_PATH"
+  else
+    echo "⚠️  LIBCLANG_PATH not set and LLVM not found at C:\\Program Files\\LLVM."
+    echo "    The Rust build may fail in libsqlite3-sys/bindgen."
+    echo "    Install LLVM with: winget install LLVM.LLVM"
+  fi
+fi
+
+# Portable zip helper: prefer `zip`, fall back to 7-Zip, then PowerShell.
+# Usage: make_zip <output.zip> <file>
+make_zip() {
+  local out="$1" file="$2"
+  rm -f "$out"
+  if command -v zip >/dev/null 2>&1; then
+    zip -q "$out" "$file"
+  elif command -v 7z >/dev/null 2>&1; then
+    7z a -tzip -bso0 -bsp0 "$out" "$file" >/dev/null
+  elif [ -x "/c/Program Files/7-Zip/7z.exe" ]; then
+    "/c/Program Files/7-Zip/7z.exe" a -tzip -bso0 -bsp0 "$out" "$file" >/dev/null
+  elif command -v powershell.exe >/dev/null 2>&1; then
+    powershell.exe -NoProfile -Command "Compress-Archive -Path '$file' -DestinationPath '$out' -Force"
+  else
+    echo "❌ No zip tool found (need 'zip', '7z', or PowerShell)" >&2
+    exit 1
+  fi
+}
 
 # Set API base URL for remote features
 export VK_SHARED_API_BASE="https://api.vibekanban.com"
@@ -59,22 +101,23 @@ cargo build --release --bin vibe-kanban-mcp --manifest-path Cargo.toml
 
 echo "📦 Creating distribution package..."
 
-# Copy the main binary
-cp ${CARGO_TARGET_DIR}/release/server vibe-kanban
-zip -q vibe-kanban.zip vibe-kanban
-rm -f vibe-kanban 
+# Copy the main binary (renamed to vibe-kanban; the npm CLI extracts
+# vibe-kanban${EXE} from the archive, so the suffix must be preserved).
+cp "${CARGO_TARGET_DIR}/release/server${EXE}" "vibe-kanban${EXE}"
+make_zip vibe-kanban.zip "vibe-kanban${EXE}"
+rm -f "vibe-kanban${EXE}"
 mv vibe-kanban.zip npx-cli/dist/$PLATFORM/vibe-kanban.zip
 
 # Copy the MCP binary
-cp ${CARGO_TARGET_DIR}/release/vibe-kanban-mcp vibe-kanban-mcp
-zip -q vibe-kanban-mcp.zip vibe-kanban-mcp
-rm -f vibe-kanban-mcp
+cp "${CARGO_TARGET_DIR}/release/vibe-kanban-mcp${EXE}" "vibe-kanban-mcp${EXE}"
+make_zip vibe-kanban-mcp.zip "vibe-kanban-mcp${EXE}"
+rm -f "vibe-kanban-mcp${EXE}"
 mv vibe-kanban-mcp.zip npx-cli/dist/$PLATFORM/vibe-kanban-mcp.zip
 
 # Copy the Review CLI binary
-cp ${CARGO_TARGET_DIR}/release/review vibe-kanban-review
-zip -q vibe-kanban-review.zip vibe-kanban-review
-rm -f vibe-kanban-review
+cp "${CARGO_TARGET_DIR}/release/review${EXE}" "vibe-kanban-review${EXE}"
+make_zip vibe-kanban-review.zip "vibe-kanban-review${EXE}"
+rm -f "vibe-kanban-review${EXE}"
 mv vibe-kanban-review.zip npx-cli/dist/$PLATFORM/vibe-kanban-review.zip
 
 echo "✅ CLI build complete!"
@@ -89,6 +132,7 @@ if [[ "$1" == "--desktop" || "$1" == "--all" ]]; then
   case "$OS" in
     macos) TAURI_OS="darwin" ;;
     linux) TAURI_OS="linux" ;;
+    windows) TAURI_OS="windows" ;;
     *) TAURI_OS="$OS" ;;
   esac
   case "$ARCH" in
