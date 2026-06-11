@@ -252,6 +252,11 @@ impl Workspace {
     /// Find workspaces that are expired and eligible for cleanup.
     /// Uses accelerated cleanup (1 hour) for archived workspaces.
     /// Uses standard cleanup (72 hours) for non-archived workspaces.
+    ///
+    /// The HAVING cutoff is computed in UTC (`datetime('now', …)`, NOT `'localtime'`):
+    /// every timestamp in this DB is written with `datetime('now')` (UTC), so mixing in
+    /// `'localtime'` shifted the cutoff by the machine's UTC offset and collapsed the
+    /// 1h/72h grace on non-UTC machines — causing cleanup to delete in-use worktrees.
     pub async fn find_expired_for_cleanup(
         pool: &SqlitePool,
     ) -> Result<Vec<Workspace>, sqlx::Error> {
@@ -282,7 +287,7 @@ impl Workspace {
                     WHERE ep2.completed_at IS NULL
                 )
             GROUP BY w.id, w.container_ref, w.updated_at
-            HAVING datetime('now', 'localtime',
+            HAVING datetime('now',
                 CASE
                     WHEN w.archived = 1
                     THEN '-1 hours'
