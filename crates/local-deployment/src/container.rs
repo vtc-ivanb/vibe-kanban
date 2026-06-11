@@ -253,10 +253,15 @@ impl LocalContainerService {
                 "No repositories found for workspace {}, cleaning up workspace directory only",
                 workspace.id
             );
-            if workspace_dir.exists()
-                && let Err(e) = tokio::fs::remove_dir_all(&workspace_dir).await
-            {
-                tracing::warn!("Failed to remove workspace directory: {}", e);
+            if workspace_dir.exists() {
+                let dir = workspace_dir.clone();
+                if let Err(e) =
+                    tokio::task::spawn_blocking(move || utils::fs::remove_dir_all_with_retry(&dir))
+                        .await
+                        .unwrap_or_else(|join_err| Err(std::io::Error::other(join_err.to_string())))
+                {
+                    tracing::warn!("Failed to remove workspace directory: {}", e);
+                }
             }
         } else {
             WorkspaceManager::cleanup_workspace(&workspace_dir, &repositories)

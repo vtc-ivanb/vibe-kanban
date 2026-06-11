@@ -252,7 +252,10 @@ impl WorktreeManager {
                 "Removing existing worktree directory: {}",
                 worktree_path.display()
             );
-            std::fs::remove_dir_all(worktree_path).map_err(WorktreeError::Io)?;
+            // Use the all-or-nothing remover: on Windows this relocates the directory
+            // atomically rather than deleting in place, so an open handle (e.g. a file
+            // watcher) can never leave a half-deleted, corrupted worktree behind.
+            utils::fs::remove_dir_all_safe(worktree_path).map_err(WorktreeError::Io)?;
         }
 
         // Step 4: Good-practice to clean up any other stale admin entries
@@ -337,7 +340,8 @@ impl WorktreeManager {
                     // Clean up physical directory if it exists
                     // Needed if previous attempt failed after directory creation
                     if worktree_path.exists() {
-                        std::fs::remove_dir_all(&worktree_path).map_err(WorktreeError::Io)?;
+                        utils::fs::remove_dir_all_safe(&worktree_path)
+                            .map_err(WorktreeError::Io)?;
                     }
                     if let Err(e2) = git_service.add_worktree(
                         &git_repo_path,
@@ -380,7 +384,9 @@ impl WorktreeManager {
                     "Force removing git worktree metadata: {}",
                     git_worktree_metadata_path.display()
                 );
-                std::fs::remove_dir_all(&git_worktree_metadata_path)?;
+                // Metadata dir lives in the shared `.git`, not the worktree itself, so
+                // an in-place retry (rather than relocate) is fine here.
+                utils::fs::remove_dir_all_with_retry(&git_worktree_metadata_path)?;
             }
         }
 
@@ -475,7 +481,7 @@ impl WorktreeManager {
 
         tokio::task::spawn_blocking(move || -> Result<(), WorktreeError> {
             if worktree_path_owned.exists() {
-                std::fs::remove_dir_all(&worktree_path_owned).map_err(WorktreeError::Io)?;
+                utils::fs::remove_dir_all_safe(&worktree_path_owned).map_err(WorktreeError::Io)?;
                 info!(
                     "Removed worktree directory: {}",
                     worktree_path_owned.display()

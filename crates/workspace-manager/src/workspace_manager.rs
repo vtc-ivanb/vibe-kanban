@@ -441,15 +441,21 @@ impl WorkspaceManager {
 
         WorktreeManager::batch_cleanup_worktrees(&cleanup_data).await?;
 
-        // Remove the workspace directory itself
-        if workspace_dir.exists()
-            && let Err(e) = tokio::fs::remove_dir_all(workspace_dir).await
-        {
-            debug!(
-                "Could not remove workspace directory {}: {}",
-                workspace_dir.display(),
-                e
-            );
+        // Remove the workspace directory itself (also reclaims any relocated worktree
+        // trash left under it by the safe remover). Best-effort.
+        if workspace_dir.exists() {
+            let dir = workspace_dir.to_path_buf();
+            if let Err(e) =
+                tokio::task::spawn_blocking(move || utils::fs::remove_dir_all_with_retry(&dir))
+                    .await
+                    .unwrap_or_else(|join_err| Err(std::io::Error::other(join_err.to_string())))
+            {
+                debug!(
+                    "Could not remove workspace directory {}: {}",
+                    workspace_dir.display(),
+                    e
+                );
+            }
         }
 
         Ok(())
@@ -588,6 +594,23 @@ impl WorkspaceManager {
             if !path.is_dir() {
                 continue;
             }
+
+            // Reclaim relocated directories left by the safe remover (Windows). A
+            // base-level trash dir is deleted outright; otherwise sweep any trash left
+            // inside a real workspace dir by worktree relocations.
+            if path
+                .file_name()
+                .and_then(|n| n.to_str())
+                .is_some_and(|n| n.starts_with(utils::fs::TRASH_PREFIX))
+            {
+                let p = path.clone();
+                let _ =
+                    tokio::task::spawn_blocking(move || utils::fs::remove_dir_all_with_retry(&p))
+                        .await;
+                continue;
+            }
+            let sweep_path = path.clone();
+            let _ = tokio::task::spawn_blocking(move || utils::fs::sweep_trash(&sweep_path)).await;
 
             let workspace_path_str = path.to_string_lossy().to_string();
             if let Ok(false) =
