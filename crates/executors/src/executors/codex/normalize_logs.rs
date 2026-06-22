@@ -2277,6 +2277,7 @@ pub fn normalize_logs(
                     call_id,
                     turn_id: _,
                     questions: event_questions,
+                    auto_resolution_ms: _,
                 }) => {
                     state.assistant = None;
                     state.thinking = None;
@@ -2400,7 +2401,9 @@ pub fn normalize_logs(
                 | EventMsg::ModelVerification(..)
                 | EventMsg::PatchApplyUpdated(..)
                 | EventMsg::ThreadGoalUpdated(..)
-                | EventMsg::ThreadSettingsApplied(..) => {}
+                | EventMsg::ThreadSettingsApplied(..)
+                | EventMsg::TurnModerationMetadata(..)
+                | EventMsg::SubAgentActivity(..) => {}
             }
         }
     });
