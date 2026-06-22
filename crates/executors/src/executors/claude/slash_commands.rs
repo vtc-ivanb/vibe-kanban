@@ -187,6 +187,13 @@ impl ClaudeCode {
                     name: "release-notes".to_string(),
                     description: Some("View release notes".to_string()),
                 },
+                SlashCommandDescription {
+                    name: "goal".to_string(),
+                    description: Some(
+                        "Set or update the goal that Claude keeps in focus for the current session"
+                            .to_string(),
+                    ),
+                },
             ]
         }).clone()
     }
