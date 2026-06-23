@@ -71,6 +71,7 @@ interface SessionProps<TExecutor extends string = string> {
   isNewSessionMode?: boolean;
   onNewSession?: () => void;
   onRenameSession?: (sessionId: string, currentName: string) => void;
+  onDeleteSession?: (sessionId: string, currentName: string) => void;
 }
 
 export interface SessionToolbarActionItem {
@@ -359,6 +360,7 @@ export function SessionChatBox<TExecutor extends string = string>({
     isNewSessionMode,
     onNewSession,
     onRenameSession,
+    onDeleteSession,
   } = session;
   const isLatestSelected =
     sessions.length > 0 && selectedSessionId === sessions[0].id;
@@ -862,21 +864,36 @@ export function SessionChatBox<TExecutor extends string = string>({
                 {t('conversation.sessions.noPreviousSessions')}
               </DropdownMenuItem>
             )}
+            {(onRenameSession || onDeleteSession) &&
+              selectedSessionId &&
+              !isNewSessionMode && <DropdownMenuSeparator />}
             {onRenameSession && selectedSessionId && !isNewSessionMode && (
-              <>
-                <DropdownMenuSeparator />
-                <DropdownMenuItem
-                  icon={PencilSimpleIcon}
-                  onClick={() =>
-                    onRenameSession(
-                      selectedSessionId,
-                      selectedSessionObj?.name ?? ''
-                    )
-                  }
-                >
-                  {t('conversation.sessions.rename')}
-                </DropdownMenuItem>
-              </>
+              <DropdownMenuItem
+                icon={PencilSimpleIcon}
+                onClick={() =>
+                  onRenameSession(
+                    selectedSessionId,
+                    selectedSessionObj?.name ?? ''
+                  )
+                }
+              >
+                {t('conversation.sessions.rename')}
+              </DropdownMenuItem>
+            )}
+            {onDeleteSession && selectedSessionId && !isNewSessionMode && (
+              <DropdownMenuItem
+                icon={TrashIcon}
+                variant="destructive"
+                disabled={isRunning || sessions.length <= 1}
+                onClick={() =>
+                  onDeleteSession(
+                    selectedSessionId,
+                    selectedSessionObj?.name ?? ''
+                  )
+                }
+              >
+                {t('conversation.sessions.delete')}
+              </DropdownMenuItem>
             )}
           </ToolbarDropdown>
         </>

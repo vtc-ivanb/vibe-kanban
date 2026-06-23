@@ -1,4 +1,5 @@
 import { useCallback, useEffect, useMemo, useRef } from 'react';
+import { useTranslation } from 'react-i18next';
 import { useQueryClient } from '@tanstack/react-query';
 import { useDropzone } from 'react-dropzone';
 import {
@@ -64,6 +65,7 @@ import type { NormalizedComment } from '@vibe/ui/components/pr-comment-node';
 import { useAppNavigation } from '@/shared/hooks/useAppNavigation';
 import { sessionsApi } from '@/shared/lib/api';
 import { RenameSessionDialog } from '@vibe/ui/components/RenameSessionDialog';
+import { ConfirmDialog } from '@vibe/ui/components/ConfirmDialog';
 import type { TurnNavigationItem } from '@vibe/ui/components/TurnNavigationPopup';
 
 /** Compute execution status from boolean flags */
@@ -172,6 +174,7 @@ export function SessionChatBoxContainer(props: SessionChatBoxContainerProps) {
   const sessionId = session?.id;
   const queryClient = useQueryClient();
   const hostId = useHostId();
+  const { t } = useTranslation('tasks');
 
   const handleRenameSession = useCallback(
     (targetSessionId: string, currentName: string) => {
@@ -187,6 +190,68 @@ export function SessionChatBoxContainer(props: SessionChatBoxContainerProps) {
     },
     [queryClient, hostId, workspaceId]
   );
+
+  const handleDeleteSession = useCallback(
+    (targetSessionId: string, currentName: string) => {
+      void (async () => {
+        const result = await ConfirmDialog.show({
+          title: t('conversation.sessions.deleteTitle'),
+          message: currentName
+            ? t('conversation.sessions.deleteNamedMessage', {
+                name: currentName,
+              })
+            : t('conversation.sessions.deleteMessage'),
+          confirmText: t('conversation.sessions.delete'),
+          cancelText: t('common:buttons.cancel'),
+          variant: 'destructive',
+        });
+        if (result !== 'confirmed') return;
+
+        // Pick the session to switch to once the current one is gone.
+        const remaining = sessions.filter((s) => s.id !== targetSessionId);
+        const nextSession =
+          targetSessionId === sessionId ? remaining[0] : undefined;
+
+        try {
+          await sessionsApi.delete(targetSessionId);
+        } catch (err) {
+          void ConfirmDialog.show({
+            title: t('common:error'),
+            message:
+              err instanceof Error
+                ? err.message
+                : t('conversation.sessions.deleteError'),
+            confirmText: t('common:ok'),
+            icon: false,
+          });
+          return;
+        }
+
+        void queryClient.invalidateQueries({
+          queryKey: workspaceSessionKeys.byWorkspace(workspaceId, hostId),
+        });
+
+        if (targetSessionId === sessionId) {
+          if (nextSession) {
+            onSelectSession?.(nextSession.id);
+          } else {
+            onStartNewSession?.();
+          }
+        }
+      })();
+    },
+    [
+      t,
+      sessions,
+      sessionId,
+      queryClient,
+      hostId,
+      workspaceId,
+      onSelectSession,
+      onStartNewSession,
+    ]
+  );
+
   const appNavigation = useAppNavigation();
 
   const { executeAction } = useActions();
@@ -1043,6 +1108,7 @@ export function SessionChatBoxContainer(props: SessionChatBoxContainerProps) {
         isNewSessionMode: needsExecutorSelection,
         onNewSession: onStartNewSession,
         onRenameSession: handleRenameSession,
+        onDeleteSession: handleDeleteSession,
       }}
       toolbarActions={{
         items: toolbarActionItems,

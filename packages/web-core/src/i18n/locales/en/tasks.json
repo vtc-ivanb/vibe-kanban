@@ -163,7 +163,12 @@
       "renameTitle": "Rename Session",
       "renameDescription": "Enter a new name for this session.",
       "renamePlaceholder": "Enter session name",
-      "renaming": "Renaming..."
+      "renaming": "Renaming...",
+      "delete": "Delete",
+      "deleteTitle": "Delete Session",
+      "deleteMessage": "Are you sure you want to delete this session? This will permanently remove its conversation history and cannot be undone.",
+      "deleteNamedMessage": "Are you sure you want to delete \"{{name}}\"? This will permanently remove its conversation history and cannot be undone.",
+      "deleteError": "Failed to delete session"
     },
     "reviewComments": {
       "count_one": "{{count}} review comment will be included",

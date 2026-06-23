@@ -212,6 +212,15 @@ impl Session {
         Ok(())
     }
 
+    /// Delete a session. Associated execution processes are removed via
+    /// `ON DELETE CASCADE`. Returns the number of rows affected.
+    pub async fn delete(pool: &SqlitePool, id: Uuid) -> Result<u64, sqlx::Error> {
+        let result = sqlx::query!(r#"DELETE FROM sessions WHERE id = $1"#, id)
+            .execute(pool)
+            .await?;
+        Ok(result.rows_affected())
+    }
+
     pub async fn update_executor(
         pool: &SqlitePool,
         id: Uuid,

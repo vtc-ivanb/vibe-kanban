@@ -438,7 +438,12 @@
       "renameTitle": "重新命名工作階段",
       "renameDescription": "輸入此工作階段的新名稱。",
       "renamePlaceholder": "輸入工作階段名稱",
-      "renaming": "正在重新命名..."
+      "renaming": "正在重新命名...",
+      "delete": "刪除",
+      "deleteTitle": "刪除工作階段",
+      "deleteMessage": "確定要刪除此工作階段嗎？這將永久刪除其對話記錄，且無法復原。",
+      "deleteNamedMessage": "確定要刪除「{{name}}」嗎？這將永久刪除其對話記錄，且無法復原。",
+      "deleteError": "刪除工作階段失敗"
     },
     "reviewComments": {
       "count_one": "{{count}} 則審查評論將被包含",

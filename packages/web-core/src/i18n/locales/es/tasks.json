@@ -438,7 +438,12 @@
       "renameTitle": "Renombrar sesión",
       "renameDescription": "Ingrese un nuevo nombre para esta sesión.",
       "renamePlaceholder": "Ingrese el nombre de la sesión",
-      "renaming": "Renombrando..."
+      "renaming": "Renombrando...",
+      "delete": "Eliminar",
+      "deleteTitle": "Eliminar sesión",
+      "deleteMessage": "¿Está seguro de que desea eliminar esta sesión? Esto eliminará permanentemente su historial de conversación y no se puede deshacer.",
+      "deleteNamedMessage": "¿Está seguro de que desea eliminar \"{{name}}\"? Esto eliminará permanentemente su historial de conversación y no se puede deshacer.",
+      "deleteError": "No se pudo eliminar la sesión"
     },
     "reviewComments": {
       "count_one": "{{count}} comentario de revisión será incluido",

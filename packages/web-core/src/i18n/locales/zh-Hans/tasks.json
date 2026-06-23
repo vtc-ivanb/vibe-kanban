@@ -420,7 +420,12 @@
       "renameTitle": "重命名会话",
       "renameDescription": "输入此会话的新名称。",
       "renamePlaceholder": "输入会话名称",
-      "renaming": "正在重命名..."
+      "renaming": "正在重命名...",
+      "delete": "删除",
+      "deleteTitle": "删除会话",
+      "deleteMessage": "确定要删除此会话吗？这将永久删除其对话历史记录，且无法撤消。",
+      "deleteNamedMessage": "确定要删除“{{name}}”吗？这将永久删除其对话历史记录，且无法撤消。",
+      "deleteError": "删除会话失败"
     },
     "reviewComments": {
       "count_one": "{{count}} 条审查评论将被包含",

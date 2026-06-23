@@ -394,6 +394,13 @@ export const sessionsApi = {
     });
     return handleApiResponse<Session>(response);
   },
+
+  delete: async (sessionId: string): Promise<void> => {
+    const response = await makeRequest(`/api/sessions/${sessionId}`, {
+      method: 'DELETE',
+    });
+    return handleApiResponse<void>(response);
+  },
 };
 
 // Workspace APIs
