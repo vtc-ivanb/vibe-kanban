@@ -44,7 +44,11 @@ async fn main() -> Result<(), VibeKanbanError> {
         level = log_level
     );
     let env_filter = EnvFilter::try_new(filter_string).expect("Failed to create tracing filter");
+    // Optional file sink (see `utils::logging`). Keep the guard alive for the
+    // whole process so the background writer flushes on shutdown.
+    let (file_log_layer, _file_log_guard) = utils::logging::file_layer();
     tracing_subscriber::registry()
+        .with(file_log_layer)
         .with(tracing_subscriber::fmt::layer().with_filter(env_filter))
         .with(sentry_layer())
         .init();

@@ -384,6 +384,13 @@ impl DiffStreamManager {
         let changed_paths =
             extract_changed_paths(&events, canonical_worktree, &self.args.worktree_path);
 
+        tracing::trace!(
+            repo = %self.repo_key(),
+            event_count = events.len(),
+            ?changed_paths,
+            "diff_stream: filesystem events -> changed paths"
+        );
+
         if changed_paths.is_empty() {
             return Ok(());
         }
@@ -583,6 +590,37 @@ impl DiffStreamManager {
             .difference(&self.known_paths.read().unwrap())
             .cloned()
             .collect();
+
+        // Diagnostic logging only. Gated on the target's DEBUG level so that in
+        // production (where this target is off) we don't take the extra lock,
+        // iteration and allocation. Runs before stat_changed/new_files are
+        // consumed below so it can borrow them rather than clone. `not_rediffed`
+        // is the smoking gun: tracked files that still differ from base but are
+        // skipped because (mtime, len) looked unchanged — if their filesystem
+        // event was also missed, the diff goes stale until the next reset.
+        if tracing::enabled!(tracing::Level::DEBUG) {
+            let stat_changed_set: HashSet<&str> =
+                stat_changed.iter().map(String::as_str).collect();
+            let skipped: Vec<String> = {
+                let known = self.known_paths.read().unwrap();
+                known
+                    .iter()
+                    .filter(|p| fresh_paths.contains(*p) && !stat_changed_set.contains(p.as_str()))
+                    .cloned()
+                    .collect()
+            };
+            tracing::debug!(
+                repo = %self.repo_key(),
+                head_changed,
+                force_discovery,
+                stat_changed = ?stat_changed,
+                new_files = ?new_files,
+                removed = ?removed,
+                not_rediffed = ?skipped,
+                "diff_stream: reconcile discovery pass"
+            );
+        }
+
         let mut paths_to_diff: Vec<String> = stat_changed
             .into_iter()
             .filter(|p| fresh_paths.contains(p))

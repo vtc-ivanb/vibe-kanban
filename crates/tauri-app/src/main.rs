@@ -124,7 +124,11 @@ fn main() {
 
     sentry_utils::init_once(SentrySource::Desktop);
 
+    // Optional file sink (see `utils::logging`). The guard must outlive the app
+    // so the background writer flushes; keep it bound for the whole of `main`.
+    let (file_log_layer, _file_log_guard) = utils::logging::file_layer();
     tracing_subscriber::registry()
+        .with(file_log_layer)
         .with(tracing_subscriber::fmt::layer().with_filter(env_filter))
         .with(sentry_layer())
         .init();
