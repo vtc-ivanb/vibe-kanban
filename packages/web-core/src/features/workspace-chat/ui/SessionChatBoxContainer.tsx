@@ -296,6 +296,28 @@ export function SessionChatBoxContainer(props: SessionChatBoxContainerProps) {
       });
   }, [entries]);
 
+  // Previously sent messages for terminal-style cursor-up history recall.
+  // Chronological (oldest first), with blanks and consecutive duplicates dropped.
+  // userMessageTurns gets a fresh identity on every streamed token, so keep the
+  // previous array reference when the content is unchanged to avoid re-rendering
+  // the editor mid-run.
+  const messageHistoryRef = useRef<string[]>([]);
+  const messageHistory: string[] = useMemo(() => {
+    const result: string[] = [];
+    for (const turn of userMessageTurns) {
+      const content = turn.content?.trim();
+      if (!content) continue;
+      if (result[result.length - 1] === content) continue;
+      result.push(content);
+    }
+    const prev = messageHistoryRef.current;
+    if (prev.length === result.length && prev.every((v, i) => v === result[i])) {
+      return prev;
+    }
+    messageHistoryRef.current = result;
+    return result;
+  }, [userMessageTurns]);
+
   // Execution state
   const { isAttemptRunning, stopExecution, isStopping, processes } =
     useWorkspaceExecution(workspaceId);
@@ -994,9 +1016,10 @@ export function SessionChatBoxContainer(props: SessionChatBoxContainerProps) {
         onPasteFiles={onPasteFiles}
         localAttachments={localAttachments}
         sendShortcut={config?.send_message_shortcut}
+        messageHistory={messageHistory}
       />
     ),
-    [config?.send_message_shortcut, sessionId]
+    [config?.send_message_shortcut, sessionId, messageHistory]
   );
 
   const modelSelectorNode = effectiveExecutor ? (

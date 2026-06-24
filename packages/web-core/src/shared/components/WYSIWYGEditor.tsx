@@ -46,6 +46,7 @@ import {
 } from '@vibe/ui/components/FileTagTypeaheadPlugin';
 import { SlashCommandTypeaheadPlugin } from '@vibe/ui/components/SlashCommandTypeaheadPlugin';
 import { KeyboardCommandsPlugin } from '@vibe/ui/components/KeyboardCommandsPlugin';
+import { MessageHistoryPlugin } from '@vibe/ui/components/MessageHistoryPlugin';
 import { ImageKeyboardPlugin } from '@vibe/ui/components/ImageKeyboardPlugin';
 import { ComponentInfoKeyboardPlugin } from '@vibe/ui/components/ComponentInfoKeyboardPlugin';
 import { ReadOnlyLinkPlugin } from '@vibe/ui/components/ReadOnlyLinkPlugin';
@@ -124,6 +125,11 @@ type WysiwygProps = {
   onDelete?: () => void;
   /** Auto-focus the editor on mount */
   autoFocus?: boolean;
+  /**
+   * Previously sent messages (chronological, oldest first) for terminal-style
+   * cursor-up history recall.
+   */
+  messageHistory?: string[];
   /** Function to find a matching diff path for clickable inline code (only in read-only mode) */
   findMatchingDiffPath?: (text: string) => string | null;
   /** Callback when clickable inline code is clicked (only in read-only mode) */
@@ -269,6 +275,7 @@ const WYSIWYGEditor = forwardRef<WYSIWYGEditorRef, WysiwygProps>(
       onEdit,
       onDelete,
       autoFocus = false,
+      messageHistory,
       findMatchingDiffPath,
       onCodeClick,
       hideActions = false,
@@ -589,6 +596,12 @@ const WYSIWYGEditor = forwardRef<WYSIWYGEditorRef, WysiwygProps>(
                         transformers={allTransformers}
                         sendShortcut={sendShortcut}
                       />
+                      {messageHistory && messageHistory.length > 0 && (
+                        <MessageHistoryPlugin
+                          history={messageHistory}
+                          transformers={allTransformers}
+                        />
+                      )}
                     </TypeaheadOpenProvider>
                     <ImageKeyboardPlugin isTargetNode={$isImageNode} />
                     <ComponentInfoKeyboardPlugin
