@@ -801,6 +801,10 @@ impl LocalContainerService {
             let db_stream_handle = container.take_db_stream_handle(&exec_id).await;
             if let Some(msg_arc) = msg_stores.write().await.remove(&exec_id) {
                 msg_arc.push_finished();
+                tracing::debug!(
+                    exec_id = %exec_id,
+                    "finalized log store (pushed Finished, evicted from memory); streams for this process will now terminate"
+                );
             }
             if let Some(handle) = db_stream_handle {
                 let _ = tokio::time::timeout(Duration::from_secs(5), handle).await;
@@ -824,6 +828,8 @@ impl LocalContainerService {
         let (tx, rx) = tokio::sync::oneshot::channel::<std::io::Result<std::process::ExitStatus>>();
         let child_store = self.child_store.clone();
         tokio::spawn(async move {
+            let wait_started = Instant::now();
+            let mut warned_long_running = false;
             loop {
                 let child_lock = {
                     let map = child_store.read().await;
@@ -833,6 +839,11 @@ impl LocalContainerService {
                     let mut child_handler = child_lock.write().await;
                     match child_handler.try_wait() {
                         Ok(Some(status)) => {
+                            tracing::debug!(
+                                exec_id = %exec_id,
+                                elapsed_secs = wait_started.elapsed().as_secs_f64(),
+                                "process group fully exited; reporting completion"
+                            );
                             let _ = tx.send(Ok(status));
                             break;
                         }
@@ -847,6 +858,22 @@ impl LocalContainerService {
                         "Child handle missing for {exec_id}"
                     ))));
                     break;
+                }
+                // Diagnostic (one-shot, only for unusually long-lived groups): a
+                // process whose group never finishes exiting (e.g. a cleanup
+                // script like `pnpm test` that leaves an orphaned child alive in
+                // the group / Windows Job Object) stays "running" here, so its
+                // status is never updated and its log store is never finalized.
+                // This is also normal for long agent turns and dev servers, hence
+                // a single debug line past a high threshold rather than repeated
+                // warnings.
+                if !warned_long_running && wait_started.elapsed() >= Duration::from_secs(300) {
+                    warned_long_running = true;
+                    tracing::debug!(
+                        exec_id = %exec_id,
+                        waited_secs = wait_started.elapsed().as_secs(),
+                        "process group still running after 5m without exit; expected for long agent turns / dev servers, but if this process looks finished in the UI its log store is not finalized yet"
+                    );
                 }
                 tokio::time::sleep(Duration::from_millis(250)).await;
             }

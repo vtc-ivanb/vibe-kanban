@@ -97,6 +97,23 @@ impl MsgStore {
             .collect()
     }
 
+    /// Number of buffered history messages (cheap; no clone). Diagnostic use.
+    pub fn history_len(&self) -> usize {
+        self.inner.read().unwrap().history.len()
+    }
+
+    /// Whether a `Finished` marker is present in history (cheap; no clone).
+    /// If false while the owning process is no longer running, the stream this
+    /// store backs will never terminate on its own. Diagnostic use.
+    pub fn is_finished(&self) -> bool {
+        self.inner
+            .read()
+            .unwrap()
+            .history
+            .iter()
+            .any(|s| matches!(s.msg, LogMsg::Finished))
+    }
+
     /// History then live, as `LogMsg`.
     pub fn history_plus_stream(
         &self,

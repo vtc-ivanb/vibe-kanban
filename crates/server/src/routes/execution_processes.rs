@@ -64,7 +64,7 @@ async fn handle_raw_logs_ws(
 ) -> anyhow::Result<()> {
     use std::sync::{
         Arc,
-        atomic::{AtomicUsize, Ordering},
+        atomic::{AtomicBool, AtomicUsize, Ordering},
     };
 
     use executors::logs::utils::patch::ConversationPatch;
@@ -85,8 +85,11 @@ async fn handle_raw_logs_ws(
     };
 
     let counter = Arc::new(AtomicUsize::new(0));
+    // Diagnostic: did this stream ever yield the terminating Finished marker?
+    let saw_finished = Arc::new(AtomicBool::new(false));
     let mut stream = raw_stream.map_ok({
         let counter = counter.clone();
+        let saw_finished = saw_finished.clone();
         move |m| match m {
             LogMsg::Stdout(content) => {
                 let index = counter.fetch_add(1, Ordering::SeqCst);
@@ -98,11 +101,16 @@ async fn handle_raw_logs_ws(
                 let patch = ConversationPatch::add_stderr(index, content);
                 LogMsg::JsonPatch(patch).to_ws_message_unchecked()
             }
-            LogMsg::Finished => LogMsg::Finished.to_ws_message_unchecked(),
+            LogMsg::Finished => {
+                saw_finished.store(true, Ordering::SeqCst);
+                LogMsg::Finished.to_ws_message_unchecked()
+            }
             _ => unreachable!("Raw stream should only have Stdout/Stderr/Finished"),
         }
     });
 
+    let started = std::time::Instant::now();
+    let mut sent: u64 = 0;
     loop {
         tokio::select! {
             item = stream.next() => {
@@ -111,6 +119,7 @@ async fn handle_raw_logs_ws(
                         if socket.send(msg).await.is_err() {
                             break;
                         }
+                        sent += 1;
                     }
                     Some(Err(e)) => {
                         tracing::error!("stream error: {}", e);
@@ -129,6 +138,16 @@ async fn handle_raw_logs_ws(
             }
         }
     }
+    // Diagnostic: if a raw-logs WS stays open for a long time having sent few
+    // messages and no Finished, this is the perpetual-loading symptom — the
+    // client is waiting on a Finished marker that the live store never emits.
+    tracing::debug!(
+        exec_id = %exec_id,
+        msgs_sent = sent,
+        sent_finished = saw_finished.load(Ordering::SeqCst),
+        elapsed_secs = started.elapsed().as_secs_f64(),
+        "raw logs WS closing"
+    );
     // Send a proper close frame so the client sees code 1000 (normal closure)
     // instead of an abnormal TCP drop that triggers reconnection attempts.
     let _ = socket.close().await;
@@ -149,7 +168,7 @@ async fn stream_normalized_logs_ws(
         match stream {
             Some(stream) => {
                 let stream = stream.err_into::<anyhow::Error>().into_stream();
-                if let Err(e) = handle_normalized_logs_ws(socket, stream).await {
+                if let Err(e) = handle_normalized_logs_ws(socket, exec_id, stream).await {
                     tracing::warn!("normalized logs WS closed: {}", e);
                 }
             }
@@ -167,9 +186,27 @@ async fn stream_normalized_logs_ws(
 
 async fn handle_normalized_logs_ws(
     mut socket: MaybeSignedWebSocket,
+    exec_id: Uuid,
     stream: impl futures_util::Stream<Item = anyhow::Result<LogMsg>> + Unpin + Send + 'static,
 ) -> anyhow::Result<()> {
-    let mut stream = stream.map_ok(|msg| msg.to_ws_message_unchecked());
+    use std::sync::{
+        Arc,
+        atomic::{AtomicBool, Ordering},
+    };
+
+    // Diagnostic: did this stream ever yield the terminating Finished marker?
+    let saw_finished = Arc::new(AtomicBool::new(false));
+    let mut stream = stream.map_ok({
+        let saw_finished = saw_finished.clone();
+        move |msg| {
+            if matches!(msg, LogMsg::Finished) {
+                saw_finished.store(true, Ordering::SeqCst);
+            }
+            msg.to_ws_message_unchecked()
+        }
+    });
+    let started = std::time::Instant::now();
+    let mut sent: u64 = 0;
     loop {
         tokio::select! {
             item = stream.next() => {
@@ -178,6 +215,7 @@ async fn handle_normalized_logs_ws(
                         if socket.send(msg).await.is_err() {
                             break;
                         }
+                        sent += 1;
                     }
                     Some(Err(e)) => {
                         tracing::error!("stream error: {}", e);
@@ -196,6 +234,13 @@ async fn handle_normalized_logs_ws(
             }
         }
     }
+    tracing::debug!(
+        exec_id = %exec_id,
+        msgs_sent = sent,
+        sent_finished = saw_finished.load(Ordering::SeqCst),
+        elapsed_secs = started.elapsed().as_secs_f64(),
+        "normalized logs WS closing"
+    );
     let _ = socket.close().await;
     Ok(())
 }

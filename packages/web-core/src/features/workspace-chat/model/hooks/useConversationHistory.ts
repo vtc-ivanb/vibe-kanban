@@ -104,14 +104,24 @@ export const useConversationHistory = ({
     }
 
     return new Promise<PatchType[]>((resolve) => {
+      // Diagnostic: an OPEN with no matching FINISHED/ERROR is the perpetual-
+      // loading bug — this historic stream never received its Finished marker,
+      // so the await below (and the whole initial load) hangs on this process.
+      const startedAt = performance.now();
+      console.debug(
+        `[conv-history] historic stream OPEN exec=${executionProcess.id} type=${executionProcess.executor_action.typ.type} status=${executionProcess.status} url=${url}`
+      );
       const controller = streamJsonPatchEntries<PatchType>(url, {
         onFinished: (allEntries) => {
+          console.debug(
+            `[conv-history] historic stream FINISHED exec=${executionProcess.id} entries=${allEntries.length} elapsedMs=${Math.round(performance.now() - startedAt)}`
+          );
           controller.close();
           resolve(allEntries);
         },
         onError: (err) => {
           console.warn(
-            `Error loading entries for historic execution process ${executionProcess.id}`,
+            `[conv-history] historic stream ERROR exec=${executionProcess.id} elapsedMs=${Math.round(performance.now() - startedAt)}`,
             err
           );
           controller.close();
@@ -393,7 +403,14 @@ export const useConversationHistory = ({
     (async () => {
       if (loadedInitialEntries.current) return;
 
-      if (isLoading) return;
+      // Diagnostic: while this logs, the spinner is gated on the execution-
+      // processes list stream delivering its first snapshot (no timeout here).
+      if (isLoading) {
+        console.debug(
+          `[conv-history] initial load WAITING on execution-processes list snapshot (isLoading=true) scope=${scopeKey}`
+        );
+        return;
+      }
 
       if (executionProcesses.current.length === 0) {
         if (emittedEmptyInitialRef.current) return;
@@ -404,8 +421,17 @@ export const useConversationHistory = ({
 
       emittedEmptyInitialRef.current = false;
 
+      // Diagnostic: a START with no matching DONE means the initial history load
+      // is hung awaiting one of the per-process streams logged above.
+      const procSummary = executionProcesses.current
+        .map((p) => `${p.id.slice(0, 8)}:${p.status}`)
+        .join(',');
+      console.debug(
+        `[conv-history] loadHistoricEntries START scope=${scopeKey} processes=[${procSummary}]`
+      );
       const allInitialEntries = await loadHistoricEntries(MIN_INITIAL_ENTRIES);
       if (cancelled) return;
+      console.debug(`[conv-history] loadHistoricEntries DONE scope=${scopeKey}`);
       loadedInitialEntries.current = true;
       mergeIntoDisplayed((state) => {
         Object.assign(state, allInitialEntries);

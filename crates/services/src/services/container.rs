@@ -800,6 +800,12 @@ pub trait ContainerService {
     ) -> Option<futures::stream::BoxStream<'static, Result<LogMsg, std::io::Error>>> {
         if let Some(store) = self.get_msg_store_by_id(id).await {
             // First try in-memory store
+            tracing::debug!(
+                exec_id = %id,
+                history_len = store.history_len(),
+                is_finished = store.is_finished(),
+                "stream_raw_logs: serving LIVE in-memory store (will not end until Finished is pushed)"
+            );
             return Some(
                 store
                     .history_plus_stream()
@@ -812,6 +818,7 @@ pub trait ContainerService {
                     .boxed(),
             );
         } else {
+            tracing::debug!(exec_id = %id, "stream_raw_logs: store evicted, serving finite snapshot from DB");
             let messages = execution_process::load_raw_log_messages(&self.db().pool, *id).await?;
 
             let stream = futures::stream::iter(
@@ -832,6 +839,12 @@ pub trait ContainerService {
         id: &Uuid,
     ) -> Option<futures::stream::BoxStream<'static, Result<LogMsg, std::io::Error>>> {
         if let Some(store) = self.get_msg_store_by_id(id).await {
+            tracing::debug!(
+                exec_id = %id,
+                history_len = store.history_len(),
+                is_finished = store.is_finished(),
+                "stream_normalized_logs: serving LIVE in-memory store (terminates only once history contains Finished)"
+            );
             Some(
                 store
                     .history_plus_stream()
@@ -843,6 +856,7 @@ pub trait ContainerService {
                     .boxed(),
             )
         } else {
+            tracing::debug!(exec_id = %id, "stream_normalized_logs: store evicted, serving finite snapshot from DB");
             let raw_messages =
                 execution_process::load_raw_log_messages(&self.db().pool, *id).await?;
 
