@@ -199,6 +199,18 @@
           "helper": "Custom prompt for the commit reminder. The git status will be appended automatically."
         }
       },
+      "mergeCommit": {
+        "title": "Merge commit message",
+        "description": "Have an agent generate the commit message when merging.",
+        "enabled": {
+          "label": "Generate commit message with an agent",
+          "helper": "When merging, an agent writes a title + body commit message. Falls back to the default message if generation fails."
+        },
+        "customPrompt": {
+          "useCustom": "Use a custom prompt",
+          "helper": "Available placeholders: {task_title}, {task_description}, {branch}, {target_branch}, {vk_id}, {message_file}."
+        }
+      },
       "notifications": {
         "title": "Notifications",
         "description": "Control when and how you receive notifications.",

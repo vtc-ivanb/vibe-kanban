@@ -599,8 +599,7 @@ impl DiffStreamManager {
         // skipped because (mtime, len) looked unchanged — if their filesystem
         // event was also missed, the diff goes stale until the next reset.
         if tracing::enabled!(tracing::Level::DEBUG) {
-            let stat_changed_set: HashSet<&str> =
-                stat_changed.iter().map(String::as_str).collect();
+            let stat_changed_set: HashSet<&str> = stat_changed.iter().map(String::as_str).collect();
             let skipped: Vec<String> = {
                 let known = self.known_paths.read().unwrap();
                 known

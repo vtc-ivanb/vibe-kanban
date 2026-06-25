@@ -191,6 +191,18 @@
           "helper": "提交提醒的自訂提示。git 狀態將自動追加。"
         }
       },
+      "mergeCommit": {
+        "title": "合併提交訊息",
+        "description": "合併時由代理生成提交訊息。",
+        "enabled": {
+          "label": "使用代理生成提交訊息",
+          "helper": "合併時，代理會撰寫包含標題和正文的提交訊息。如果生成失敗，則回退到預設訊息。"
+        },
+        "customPrompt": {
+          "useCustom": "使用自訂提示",
+          "helper": "可用佔位符：{task_title}, {task_description}, {branch}, {target_branch}, {vk_id}, {message_file}。"
+        }
+      },
       "notifications": {
         "title": "通知",
         "description": "控制何時與如何接收通知。",

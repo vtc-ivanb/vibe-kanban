@@ -191,6 +191,18 @@
           "helper": "커밋 알림용 사용자 정의 프롬프트. git 상태가 자동으로 추가됩니다."
         }
       },
+      "mergeCommit": {
+        "title": "머지 커밋 메시지",
+        "description": "머지 시 에이전트가 커밋 메시지를 생성합니다.",
+        "enabled": {
+          "label": "에이전트로 커밋 메시지 생성",
+          "helper": "머지 시 에이전트가 제목과 본문을 포함한 커밋 메시지를 작성합니다. 생성에 실패하면 기본 메시지로 대체됩니다."
+        },
+        "customPrompt": {
+          "useCustom": "사용자 정의 프롬프트 사용",
+          "helper": "사용 가능한 플레이스홀더: {task_title}, {task_description}, {branch}, {target_branch}, {vk_id}, {message_file}."
+        }
+      },
       "notifications": {
         "title": "알림",
         "description": "알림을 받는 시기와 방법을 제어하세요.",

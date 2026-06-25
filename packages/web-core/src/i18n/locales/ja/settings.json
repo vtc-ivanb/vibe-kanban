@@ -191,6 +191,18 @@
           "helper": "コミットリマインダー用のカスタムプロンプト。gitステータスは自動的に追加されます。"
         }
       },
+      "mergeCommit": {
+        "title": "マージコミットメッセージ",
+        "description": "マージ時にエージェントがコミットメッセージを生成します。",
+        "enabled": {
+          "label": "エージェントでコミットメッセージを生成",
+          "helper": "マージ時、エージェントがタイトルと本文を含むコミットメッセージを作成します。生成に失敗した場合はデフォルトメッセージにフォールバックします。"
+        },
+        "customPrompt": {
+          "useCustom": "カスタムプロンプトを使用",
+          "helper": "利用可能なプレースホルダー: {task_title}, {task_description}, {branch}, {target_branch}, {vk_id}, {message_file}。"
+        }
+      },
       "notifications": {
         "title": "通知",
         "description": "通知を受け取るタイミングと方法を制御します。",

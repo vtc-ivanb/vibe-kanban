@@ -147,6 +147,7 @@
     "states": {
       "merged": "已合并！",
       "merging": "合并中...",
+      "generatingCommitMessage": "正在生成提交消息…",
       "merge": "合并",
       "rebasing": "变基中...",
       "rebase": "变基",

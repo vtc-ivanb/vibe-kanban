@@ -5,7 +5,11 @@ import { useForcePush } from '@/shared/hooks/useForcePush';
 import { useChangeTargetBranch } from '@/shared/hooks/useChangeTargetBranch';
 import { useGitOperationsError } from '@/shared/hooks/GitOperationsContext';
 import { Result } from '@/shared/lib/api';
-import type { GitOperationError, PushWorkspaceRequest } from 'shared/types';
+import type {
+  GitOperationError,
+  MergeWorkspaceResponse,
+  PushWorkspaceRequest,
+} from 'shared/types';
 import { ForcePushDialog } from '@/shared/dialogs/command-bar/ForcePushDialog';
 
 export function useGitOperations(
@@ -33,7 +37,11 @@ export function useGitOperations(
 
   const merge = useMerge(
     workspaceId,
-    () => setError(null),
+    (_result: MergeWorkspaceResponse) => {
+      // Clear any previous git error on success (sync or async merge).
+      // The generating state is surfaced in the UI via the call site directly.
+      setError(null);
+    },
     (err: unknown) => {
       const message =
         err && typeof err === 'object' && 'message' in err

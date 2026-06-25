@@ -231,6 +231,7 @@
     "states": {
       "merged": "Merged!",
       "merging": "Merging...",
+      "generatingCommitMessage": "Generating commit message…",
       "merge": "Merge",
       "rebasing": "Rebasing...",
       "rebase": "Rebase",

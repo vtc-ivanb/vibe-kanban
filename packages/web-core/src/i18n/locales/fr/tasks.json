@@ -231,6 +231,7 @@
     "states": {
       "merged": "Fusionné !",
       "merging": "Fusion en cours...",
+      "generatingCommitMessage": "Génération du message de commit…",
       "merge": "Fusionner",
       "rebasing": "Rebasage en cours...",
       "rebase": "Rebaser",

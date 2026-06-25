@@ -1,6 +1,7 @@
 import { useMutation, useQueryClient } from '@tanstack/react-query';
 import { workspacesApi } from '@/shared/lib/api';
 import { repoBranchKeys } from '@/shared/hooks/useRepoBranches';
+import type { MergeWorkspaceResponse } from 'shared/types';
 
 type MergeParams = {
   repoId: string;
@@ -8,19 +9,19 @@ type MergeParams = {
 
 export function useMerge(
   workspaceId?: string,
-  onSuccess?: () => void,
+  onSuccess?: (result: MergeWorkspaceResponse) => void,
   onError?: (err: unknown) => void
 ) {
   const queryClient = useQueryClient();
 
-  return useMutation<void, unknown, MergeParams>({
+  return useMutation<MergeWorkspaceResponse, unknown, MergeParams>({
     mutationFn: (params: MergeParams) => {
-      if (!workspaceId) return Promise.resolve();
+      if (!workspaceId) return Promise.resolve({ generating: false });
       return workspacesApi.merge(workspaceId, {
         repo_id: params.repoId,
       });
     },
-    onSuccess: () => {
+    onSuccess: (result) => {
       // Refresh attempt-specific branch information
       queryClient.invalidateQueries({
         queryKey: ['branchStatus', workspaceId],
@@ -29,7 +30,7 @@ export function useMerge(
       // Invalidate all repo branches queries
       queryClient.invalidateQueries({ queryKey: repoBranchKeys.all });
 
-      onSuccess?.();
+      onSuccess?.(result);
     },
     onError: (err) => {
       console.error('Failed to merge:', err);

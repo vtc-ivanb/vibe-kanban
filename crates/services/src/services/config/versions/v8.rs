@@ -21,6 +21,10 @@ fn default_commit_reminder_enabled() -> bool {
     true
 }
 
+fn default_merge_commit_message_enabled() -> bool {
+    false
+}
+
 fn default_relay_enabled() -> bool {
     true
 }
@@ -62,6 +66,10 @@ pub struct Config {
     pub commit_reminder_enabled: bool,
     #[serde(default)]
     pub commit_reminder_prompt: Option<String>,
+    #[serde(default = "default_merge_commit_message_enabled")]
+    pub merge_commit_message_enabled: bool,
+    #[serde(default)]
+    pub merge_commit_prompt: Option<String>,
     #[serde(default)]
     pub send_message_shortcut: SendMessageShortcut,
     #[serde(default = "default_relay_enabled")]
@@ -96,6 +104,8 @@ impl Config {
             pr_auto_description_prompt: None,
             commit_reminder_enabled: true,
             commit_reminder_prompt: None,
+            merge_commit_message_enabled: false,
+            merge_commit_prompt: None,
             send_message_shortcut: SendMessageShortcut::default(),
             relay_enabled: true,
             host_nickname: None,
@@ -152,9 +162,23 @@ impl Default for Config {
             pr_auto_description_prompt: None,
             commit_reminder_enabled: true,
             commit_reminder_prompt: None,
+            merge_commit_message_enabled: false,
+            merge_commit_prompt: None,
             send_message_shortcut: SendMessageShortcut::default(),
             relay_enabled: true,
             host_nickname: None,
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn merge_commit_message_defaults_are_off() {
+        let cfg = Config::default();
+        assert!(!cfg.merge_commit_message_enabled);
+        assert!(cfg.merge_commit_prompt.is_none());
     }
 }

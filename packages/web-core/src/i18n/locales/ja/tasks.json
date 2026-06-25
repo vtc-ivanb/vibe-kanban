@@ -186,6 +186,7 @@
       "merge": "マージ",
       "merged": "マージ完了！",
       "merging": "マージ中...",
+      "generatingCommitMessage": "コミットメッセージ生成中…",
       "push": "プッシュ",
       "pushed": "プッシュ完了！",
       "pushing": "プッシュ中...",

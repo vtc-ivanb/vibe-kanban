@@ -60,6 +60,8 @@ use worktree_manager::WorktreeError;
 use crate::services::{execution_process, notification::NotificationService};
 pub type ContainerRef = String;
 
+use crate::services::merge_commit;
+
 #[derive(Debug, Error)]
 pub enum ContainerError {
     #[error(transparent)]
@@ -86,6 +88,16 @@ pub enum ContainerError {
 
 #[async_trait]
 pub trait ContainerService {
+    /// Register a pending squash-merge to be performed when the corresponding
+    /// `MergeCommitMessage` execution completes. Default impl is a no-op for
+    /// deployments that don't support agent-generated merge messages.
+    fn register_pending_merge(
+        &self,
+        _execution_process_id: Uuid,
+        _pending: merge_commit::PendingMerge,
+    ) {
+    }
+
     fn msg_stores(&self) -> &Arc<RwLock<HashMap<Uuid, Arc<MsgStore>>>>;
 
     fn db(&self) -> &DBService;

@@ -56,6 +56,7 @@ pub enum ExecutionProcessRunReason {
     ArchiveScript,
     CodingAgent,
     DevServer,
+    MergeCommitMessage,
 }
 
 #[derive(Debug, Clone, FromRow, Serialize, Deserialize, TS)]

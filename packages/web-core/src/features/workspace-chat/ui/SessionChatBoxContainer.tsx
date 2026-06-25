@@ -311,7 +311,10 @@ export function SessionChatBoxContainer(props: SessionChatBoxContainerProps) {
       result.push(content);
     }
     const prev = messageHistoryRef.current;
-    if (prev.length === result.length && prev.every((v, i) => v === result[i])) {
+    if (
+      prev.length === result.length &&
+      prev.every((v, i) => v === result[i])
+    ) {
       return prev;
     }
     messageHistoryRef.current = result;

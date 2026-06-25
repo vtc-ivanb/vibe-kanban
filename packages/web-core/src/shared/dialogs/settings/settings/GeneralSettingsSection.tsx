@@ -10,6 +10,7 @@ import { FolderPickerDialog } from '@/shared/dialogs/shared/FolderPickerDialog';
 import {
   type BaseCodingAgent,
   DEFAULT_COMMIT_REMINDER_PROMPT,
+  DEFAULT_MERGE_COMMIT_PROMPT,
   DEFAULT_PR_DESCRIPTION_PROMPT,
   EditorType,
   type ExecutorProfileId,
@@ -686,6 +687,58 @@ export function GeneralSettingsSection() {
                   updateDraft({ commit_reminder_prompt: value })
                 }
                 disabled={draft?.commit_reminder_prompt == null}
+              />
+            </SettingsField>
+          </>
+        )}
+      </SettingsCard>
+
+      {/* Merge commit message */}
+      <SettingsCard
+        title={t('settings.general.mergeCommit.title')}
+        description={t('settings.general.mergeCommit.description')}
+      >
+        <SettingsCheckbox
+          id="merge-commit-message"
+          label={t('settings.general.mergeCommit.enabled.label')}
+          description={t('settings.general.mergeCommit.enabled.helper')}
+          checked={draft?.merge_commit_message_enabled ?? false}
+          onChange={(checked) =>
+            updateDraft({ merge_commit_message_enabled: checked })
+          }
+        />
+
+        {draft?.merge_commit_message_enabled && (
+          <>
+            <SettingsCheckbox
+              id="use-custom-merge-commit-prompt"
+              label={t('settings.general.mergeCommit.customPrompt.useCustom')}
+              checked={draft?.merge_commit_prompt != null}
+              onChange={(checked) => {
+                if (checked) {
+                  updateDraft({
+                    merge_commit_prompt: DEFAULT_MERGE_COMMIT_PROMPT,
+                  });
+                } else {
+                  updateDraft({ merge_commit_prompt: null });
+                }
+              }}
+            />
+
+            <SettingsField
+              label=""
+              description={t(
+                'settings.general.mergeCommit.customPrompt.helper'
+              )}
+            >
+              <SettingsTextarea
+                value={
+                  draft?.merge_commit_prompt ?? DEFAULT_MERGE_COMMIT_PROMPT
+                }
+                onChange={(value) =>
+                  updateDraft({ merge_commit_prompt: value })
+                }
+                disabled={draft?.merge_commit_prompt == null}
               />
             </SettingsField>
           </>

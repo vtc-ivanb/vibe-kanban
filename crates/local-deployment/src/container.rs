@@ -17,6 +17,7 @@ use db::{
             ExecutionContext, ExecutionProcess, ExecutionProcessRunReason, ExecutionProcessStatus,
         },
         execution_process_repo_state::ExecutionProcessRepoState,
+        merge::Merge,
         repo::Repo,
         scratch::{DraftFollowUpData, Scratch, ScratchType},
         session::{Session, SessionError},
@@ -85,6 +86,7 @@ pub struct LocalContainerService {
     queued_message_service: QueuedMessageService,
     notification_service: NotificationService,
     remote_client: Option<RemoteClient>,
+    merge_intents: Arc<RwLock<HashMap<Uuid, services::services::merge_commit::PendingMerge>>>,
 }
 
 impl LocalContainerService {
@@ -125,6 +127,7 @@ impl LocalContainerService {
             queued_message_service,
             notification_service,
             remote_client,
+            merge_intents: Arc::new(RwLock::new(HashMap::new())),
         };
 
         container.spawn_workspace_cleanup();
@@ -552,94 +555,185 @@ impl LocalContainerService {
             }
 
             if let Ok(ctx) = ExecutionProcess::load_context(&db.pool, exec_id).await {
-                // Update executor session summary if available
-                if let Err(e) = container.update_executor_session_summary(&exec_id).await {
-                    tracing::warn!("Failed to update executor session summary: {}", e);
-                }
-
-                let success = matches!(
-                    ctx.execution_process.status,
-                    ExecutionProcessStatus::Completed
-                ) && exit_code == Some(0);
-
-                let cleanup_done = matches!(
+                if matches!(
                     ctx.execution_process.run_reason,
-                    ExecutionProcessRunReason::CleanupScript
-                ) && !matches!(
-                    ctx.execution_process.status,
-                    ExecutionProcessStatus::Running
-                );
-
-                let mut already_finalized = false;
-
-                if success || cleanup_done {
-                    // Commit changes (if any) and get feedback about whether changes were made
-                    let changes_committed = match container.try_commit_changes(&ctx).await {
-                        Ok(committed) => committed,
-                        Err(e) => {
-                            tracing::error!("Failed to commit changes after execution: {}", e);
-                            // Treat commit failures as if changes were made to be safe
-                            true
-                        }
-                    };
-
-                    let should_start_next = if matches!(
-                        ctx.execution_process.run_reason,
-                        ExecutionProcessRunReason::CodingAgent
-                    ) {
-                        // Check if agent made commits OR if we just committed uncommitted changes
-                        changes_committed
-                            || container
-                                .has_commits_from_execution(&ctx)
-                                .await
-                                .unwrap_or(false)
-                    } else {
-                        true
-                    };
-
-                    if should_start_next {
-                        // If the process exited successfully, start the next action
-                        if let Err(e) = container.try_start_next_action(&ctx).await {
-                            tracing::error!("Failed to start next action after completion: {}", e);
-                        }
-                    } else {
-                        tracing::info!(
-                            "Skipping cleanup script for workspace {} - no changes made by coding agent",
-                            ctx.workspace.id
-                        );
-
-                        // Manually finalize task since we're bypassing normal execution flow
-                        container.finalize_task(&ctx).await;
-                        already_finalized = true;
+                    ExecutionProcessRunReason::MergeCommitMessage
+                ) {
+                    container.complete_merge_commit_message(&ctx).await;
+                } else {
+                    // Update executor session summary if available
+                    if let Err(e) = container.update_executor_session_summary(&exec_id).await {
+                        tracing::warn!("Failed to update executor session summary: {}", e);
                     }
-                }
 
-                if !already_finalized && container.should_finalize(&ctx) {
-                    let has_chained_follow_up = ctx
-                        .execution_process
-                        .executor_action()
-                        .ok()
-                        .and_then(|action| action.next_action())
-                        .is_some();
-                    let mut started_queued_follow_up = false;
-
-                    // Only execute queued messages if the execution succeeded
-                    // If it failed or was killed, just clear the queue and finalize
-                    let should_execute_queued = !matches!(
+                    let success = matches!(
                         ctx.execution_process.status,
-                        ExecutionProcessStatus::Failed | ExecutionProcessStatus::Killed
+                        ExecutionProcessStatus::Completed
+                    ) && exit_code == Some(0);
+
+                    let cleanup_done = matches!(
+                        ctx.execution_process.run_reason,
+                        ExecutionProcessRunReason::CleanupScript
+                    ) && !matches!(
+                        ctx.execution_process.status,
+                        ExecutionProcessStatus::Running
                     );
 
-                    if let Some(queued_msg) =
-                        container.queued_message_service.take_queued(ctx.session.id)
-                    {
-                        if should_execute_queued {
+                    let mut already_finalized = false;
+
+                    if success || cleanup_done {
+                        // Commit changes (if any) and get feedback about whether changes were made
+                        let changes_committed = match container.try_commit_changes(&ctx).await {
+                            Ok(committed) => committed,
+                            Err(e) => {
+                                tracing::error!("Failed to commit changes after execution: {}", e);
+                                // Treat commit failures as if changes were made to be safe
+                                true
+                            }
+                        };
+
+                        let should_start_next = if matches!(
+                            ctx.execution_process.run_reason,
+                            ExecutionProcessRunReason::CodingAgent
+                        ) {
+                            // Check if agent made commits OR if we just committed uncommitted changes
+                            changes_committed
+                                || container
+                                    .has_commits_from_execution(&ctx)
+                                    .await
+                                    .unwrap_or(false)
+                        } else {
+                            true
+                        };
+
+                        if should_start_next {
+                            // If the process exited successfully, start the next action
+                            if let Err(e) = container.try_start_next_action(&ctx).await {
+                                tracing::error!(
+                                    "Failed to start next action after completion: {}",
+                                    e
+                                );
+                            }
+                        } else {
                             tracing::info!(
-                                "Found queued message for session {}, starting follow-up execution",
+                                "Skipping cleanup script for workspace {} - no changes made by coding agent",
+                                ctx.workspace.id
+                            );
+
+                            // Manually finalize task since we're bypassing normal execution flow
+                            container.finalize_task(&ctx).await;
+                            already_finalized = true;
+                        }
+                    }
+
+                    if !already_finalized && container.should_finalize(&ctx) {
+                        let has_chained_follow_up = ctx
+                            .execution_process
+                            .executor_action()
+                            .ok()
+                            .and_then(|action| action.next_action())
+                            .is_some();
+                        let mut started_queued_follow_up = false;
+
+                        // Only execute queued messages if the execution succeeded
+                        // If it failed or was killed, just clear the queue and finalize
+                        let should_execute_queued = !matches!(
+                            ctx.execution_process.status,
+                            ExecutionProcessStatus::Failed | ExecutionProcessStatus::Killed
+                        );
+
+                        if let Some(queued_msg) =
+                            container.queued_message_service.take_queued(ctx.session.id)
+                        {
+                            if should_execute_queued {
+                                tracing::info!(
+                                    "Found queued message for session {}, starting follow-up execution",
+                                    ctx.session.id
+                                );
+
+                                // Delete the scratch since we're consuming the queued message
+                                if let Err(e) = Scratch::delete(
+                                    &db.pool,
+                                    ctx.session.id,
+                                    &ScratchType::DraftFollowUp,
+                                )
+                                .await
+                                {
+                                    tracing::warn!(
+                                        "Failed to delete scratch after consuming queued message: {}",
+                                        e
+                                    );
+                                }
+
+                                // Execute the queued follow-up
+                                if let Err(e) = container
+                                    .start_queued_follow_up(&ctx, &queued_msg.data)
+                                    .await
+                                {
+                                    tracing::error!("Failed to start queued follow-up: {}", e);
+                                    // Fall back to finalization if follow-up fails
+                                    container.finalize_task(&ctx).await;
+                                } else {
+                                    started_queued_follow_up = true;
+                                }
+                            } else {
+                                // Execution failed or was killed - discard the queued message and finalize
+                                tracing::info!(
+                                    "Discarding queued message for session {} due to execution status {:?}",
+                                    ctx.session.id,
+                                    ctx.execution_process.status
+                                );
+                                container.finalize_task(&ctx).await;
+                            }
+                        } else {
+                            container.finalize_task(&ctx).await;
+                        }
+
+                        let should_mark_turn_unseen = matches!(
+                            ctx.execution_process.run_reason,
+                            ExecutionProcessRunReason::CodingAgent
+                        ) && !has_chained_follow_up
+                            && !started_queued_follow_up;
+
+                        if should_mark_turn_unseen
+                            && let Err(e) = CodingAgentTurn::mark_unseen_by_execution_process_id(
+                                &db.pool,
+                                ctx.execution_process.id,
+                            )
+                            .await
+                        {
+                            tracing::warn!(
+                                "Failed to mark coding agent turn unseen for execution {}: {}",
+                                ctx.execution_process.id,
+                                e
+                            );
+                        }
+                    }
+
+                    // When a parallel setup script finishes and no coding agent is running,
+                    // consume any queued message that was stuck waiting
+                    if matches!(
+                        ctx.execution_process.run_reason,
+                        ExecutionProcessRunReason::SetupScript
+                    ) && !container.should_finalize(&ctx)
+                    {
+                        let has_running_agent =
+                            ExecutionProcess::has_running_coding_agent_for_session(
+                                &db.pool,
+                                ctx.session.id,
+                            )
+                            .await
+                            .unwrap_or(true);
+
+                        if !has_running_agent
+                            && let Some(queued_msg) =
+                                container.queued_message_service.take_queued(ctx.session.id)
+                        {
+                            tracing::info!(
+                                "Parallel setup script finished with queued message for session {}, starting follow-up",
                                 ctx.session.id
                             );
 
-                            // Delete the scratch since we're consuming the queued message
                             if let Err(e) = Scratch::delete(
                                 &db.pool,
                                 ctx.session.id,
@@ -653,143 +747,66 @@ impl LocalContainerService {
                                 );
                             }
 
-                            // Execute the queued follow-up
                             if let Err(e) = container
                                 .start_queued_follow_up(&ctx, &queued_msg.data)
                                 .await
                             {
-                                tracing::error!("Failed to start queued follow-up: {}", e);
-                                // Fall back to finalization if follow-up fails
-                                container.finalize_task(&ctx).await;
-                            } else {
-                                started_queued_follow_up = true;
+                                tracing::error!(
+                                    "Failed to start queued follow-up from setup script completion: {}",
+                                    e
+                                );
                             }
-                        } else {
-                            // Execution failed or was killed - discard the queued message and finalize
-                            tracing::info!(
-                                "Discarding queued message for session {} due to execution status {:?}",
-                                ctx.session.id,
-                                ctx.execution_process.status
-                            );
-                            container.finalize_task(&ctx).await;
                         }
-                    } else {
-                        container.finalize_task(&ctx).await;
                     }
 
-                    let should_mark_turn_unseen = matches!(
-                        ctx.execution_process.run_reason,
-                        ExecutionProcessRunReason::CodingAgent
-                    ) && !has_chained_follow_up
-                        && !started_queued_follow_up;
-
-                    if should_mark_turn_unseen
-                        && let Err(e) = CodingAgentTurn::mark_unseen_by_execution_process_id(
-                            &db.pool,
-                            ctx.execution_process.id,
+                    // Fire analytics event when CodingAgent execution has finished
+                    if config.read().await.analytics_enabled
+                        && matches!(
+                            &ctx.execution_process.run_reason,
+                            ExecutionProcessRunReason::CodingAgent
                         )
-                        .await
+                        && let Some(analytics) = &analytics
                     {
-                        tracing::warn!(
-                            "Failed to mark coding agent turn unseen for execution {}: {}",
-                            ctx.execution_process.id,
-                            e
-                        );
-                    }
-                }
-
-                // When a parallel setup script finishes and no coding agent is running,
-                // consume any queued message that was stuck waiting
-                if matches!(
-                    ctx.execution_process.run_reason,
-                    ExecutionProcessRunReason::SetupScript
-                ) && !container.should_finalize(&ctx)
-                {
-                    let has_running_agent = ExecutionProcess::has_running_coding_agent_for_session(
-                        &db.pool,
-                        ctx.session.id,
-                    )
-                    .await
-                    .unwrap_or(true);
-
-                    if !has_running_agent
-                        && let Some(queued_msg) =
-                            container.queued_message_service.take_queued(ctx.session.id)
-                    {
-                        tracing::info!(
-                            "Parallel setup script finished with queued message for session {}, starting follow-up",
-                            ctx.session.id
-                        );
-
-                        if let Err(e) =
-                            Scratch::delete(&db.pool, ctx.session.id, &ScratchType::DraftFollowUp)
-                                .await
-                        {
-                            tracing::warn!(
-                                "Failed to delete scratch after consuming queued message: {}",
-                                e
-                            );
-                        }
-
-                        if let Err(e) = container
-                            .start_queued_follow_up(&ctx, &queued_msg.data)
-                            .await
-                        {
-                            tracing::error!(
-                                "Failed to start queued follow-up from setup script completion: {}",
-                                e
-                            );
-                        }
-                    }
-                }
-
-                // Fire analytics event when CodingAgent execution has finished
-                if config.read().await.analytics_enabled
-                    && matches!(
-                        &ctx.execution_process.run_reason,
-                        ExecutionProcessRunReason::CodingAgent
-                    )
-                    && let Some(analytics) = &analytics
-                {
-                    analytics.analytics_service.track_event(&analytics.user_id, "task_attempt_finished", Some(json!({
+                        analytics.analytics_service.track_event(&analytics.user_id, "task_attempt_finished", Some(json!({
                         "workspace_id": ctx.workspace.id.to_string(),
                         "session_id": ctx.session.id.to_string(),
                         "execution_success": matches!(ctx.execution_process.status, ExecutionProcessStatus::Completed),
                         "exit_code": ctx.execution_process.exit_code,
                     })));
-                }
+                    }
 
-                // Sync workspace to remote after CodingAgent execution
-                if matches!(
-                    &ctx.execution_process.run_reason,
-                    ExecutionProcessRunReason::CodingAgent
-                ) && let Some(client) = &container.remote_client
-                {
-                    let stats = diff_stream::compute_diff_stats(
-                        &container.db.pool,
-                        &container.git,
-                        &ctx.workspace,
-                    )
-                    .await;
-                    let workspace_name =
-                        Workspace::find_by_id_with_status(&container.db.pool, ctx.workspace.id)
-                            .await
-                            .ok()
-                            .flatten()
-                            .and_then(|ws| ws.workspace.name);
-                    let client = client.clone();
-                    let workspace_id = ctx.workspace.id;
-                    let archived = ctx.workspace.archived;
-                    tokio::spawn(async move {
-                        remote_sync::sync_workspace_to_remote(
-                            &client,
-                            workspace_id,
-                            workspace_name.map(Some),
-                            Some(archived),
-                            stats.as_ref(),
+                    // Sync workspace to remote after CodingAgent execution
+                    if matches!(
+                        &ctx.execution_process.run_reason,
+                        ExecutionProcessRunReason::CodingAgent
+                    ) && let Some(client) = &container.remote_client
+                    {
+                        let stats = diff_stream::compute_diff_stats(
+                            &container.db.pool,
+                            &container.git,
+                            &ctx.workspace,
                         )
                         .await;
-                    });
+                        let workspace_name =
+                            Workspace::find_by_id_with_status(&container.db.pool, ctx.workspace.id)
+                                .await
+                                .ok()
+                                .flatten()
+                                .and_then(|ws| ws.workspace.name);
+                        let client = client.clone();
+                        let workspace_id = ctx.workspace.id;
+                        let archived = ctx.workspace.archived;
+                        tokio::spawn(async move {
+                            remote_sync::sync_workspace_to_remote(
+                                &client,
+                                workspace_id,
+                                workspace_name.map(Some),
+                                Some(archived),
+                                stats.as_ref(),
+                            )
+                            .await;
+                        });
+                    }
                 }
             }
 
@@ -1076,6 +1093,118 @@ impl LocalContainerService {
         Ok(())
     }
 
+    pub async fn take_pending_merge(
+        &self,
+        execution_process_id: &Uuid,
+    ) -> Option<services::services::merge_commit::PendingMerge> {
+        self.merge_intents
+            .write()
+            .await
+            .remove(execution_process_id)
+    }
+
+    /// Completes a `MergeCommitMessage` execution: reads the agent-written
+    /// commit message, performs the squash merge (falling back to the stored
+    /// default message when generation did not produce a usable message),
+    /// records the merge, syncs to remote, and archives the workspace.
+    async fn complete_merge_commit_message(&self, ctx: &ExecutionContext) {
+        let exec_id = ctx.execution_process.id;
+
+        // The pending intent is inserted via a spawned task in
+        // `register_pending_merge`, so there is a small window where it may not
+        // be visible yet. Retry briefly before giving up.
+        let mut pending = None;
+        for _ in 0..10 {
+            if let Some(p) = self.take_pending_merge(&exec_id).await {
+                pending = Some(p);
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(100)).await;
+        }
+        let Some(pending) = pending else {
+            tracing::warn!("No pending merge intent for execution {exec_id}; skipping merge");
+            return;
+        };
+
+        // Read the agent-written message file (best-effort), then remove it.
+        let generated = tokio::fs::read_to_string(&pending.message_file).await.ok();
+        let _ = tokio::fs::remove_file(&pending.message_file).await;
+
+        let succeeded = matches!(
+            ctx.execution_process.status,
+            ExecutionProcessStatus::Completed
+        );
+        let generated = if succeeded { generated } else { None };
+        if !succeeded || generated.as_deref().map(str::trim).unwrap_or("").is_empty() {
+            tracing::warn!(
+                "Merge-commit-message generation for {exec_id} did not produce a message; \
+                 falling back to the default commit message"
+            );
+        }
+
+        let commit_message = services::services::merge_commit::select_merge_commit_message(
+            generated,
+            &pending.fallback_message,
+        );
+
+        let merge_commit_id = match self.git.merge_changes(
+            &pending.repo_path,
+            &pending.worktree_path,
+            &pending.source_branch,
+            &pending.target_branch,
+            &commit_message,
+        ) {
+            Ok(id) => id,
+            Err(e) => {
+                tracing::error!(
+                    "Failed to merge workspace {} after message generation: {e}",
+                    ctx.workspace.id
+                );
+                return;
+            }
+        };
+
+        if let Err(e) = Merge::create_direct(
+            &self.db.pool,
+            ctx.workspace.id,
+            pending.repo_id,
+            &pending.target_branch,
+            &merge_commit_id,
+        )
+        .await
+        {
+            tracing::error!(
+                "Failed to record merge for workspace {}: {e}",
+                ctx.workspace.id
+            );
+        }
+
+        if let Some(client) = &self.remote_client {
+            let client = client.clone();
+            let workspace_id = ctx.workspace.id;
+            tokio::spawn(async move {
+                remote_sync::sync_local_workspace_merge_to_remote(&client, workspace_id).await;
+            });
+        }
+
+        if !ctx.workspace.pinned
+            && let Err(e) = self.archive_workspace(ctx.workspace.id).await
+        {
+            tracing::error!("Failed to archive workspace {}: {e}", ctx.workspace.id);
+        }
+
+        // Fire analytics event for parity with the synchronous merge path.
+        if self.config.read().await.analytics_enabled
+            && let Some(analytics) = &self.analytics
+        {
+            analytics.analytics_service.track_event(
+                &analytics.user_id,
+                "task_attempt_merged",
+                Some(json!({ "workspace_id": ctx.workspace.id.to_string() })),
+            );
+        }
+    }
+
     /// Start a follow-up execution from a queued message
     async fn start_queued_follow_up(
         &self,
@@ -1165,6 +1294,17 @@ fn failure_exit_status() -> std::process::ExitStatus {
 
 #[async_trait]
 impl ContainerService for LocalContainerService {
+    fn register_pending_merge(
+        &self,
+        execution_process_id: Uuid,
+        pending: services::services::merge_commit::PendingMerge,
+    ) {
+        let intents = self.merge_intents.clone();
+        tokio::spawn(async move {
+            intents.write().await.insert(execution_process_id, pending);
+        });
+    }
+
     fn msg_stores(&self) -> &Arc<RwLock<HashMap<Uuid, Arc<MsgStore>>>> {
         &self.msg_stores
     }

@@ -70,6 +70,7 @@ import {
   QueueStatus,
   PrCommentsResponse,
   MergeWorkspaceRequest,
+  MergeWorkspaceResponse,
   PushWorkspaceRequest,
   RepoBranchStatus,
   AbortConflictsRequest,
@@ -557,7 +558,7 @@ export const workspacesApi = {
   merge: async (
     workspaceId: string,
     data: MergeWorkspaceRequest
-  ): Promise<void> => {
+  ): Promise<MergeWorkspaceResponse> => {
     const response = await makeRequest(
       `/api/workspaces/${workspaceId}/git/merge`,
       {
@@ -565,7 +566,7 @@ export const workspacesApi = {
         body: JSON.stringify(data),
       }
     );
-    return handleApiResponse<void>(response);
+    return handleApiResponse<MergeWorkspaceResponse>(response);
   },
 
   push: async (

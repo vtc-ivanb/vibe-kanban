@@ -10,12 +10,20 @@ use axum::{
     routing::{get, post},
 };
 use db::models::{
+    coding_agent_turn::CodingAgentTurn,
+    execution_process::{ExecutionProcess, ExecutionProcessRunReason},
     merge::{Merge, MergeStatus, PrMerge, PullRequestInfo},
     repo::{Repo, RepoError},
+    session::{CreateSession, Session},
+    task::Task,
     workspace::Workspace,
     workspace_repo::WorkspaceRepo,
 };
 use deployment::Deployment;
+use executors::actions::{
+    ExecutorAction, ExecutorActionType, coding_agent_follow_up::CodingAgentFollowUpRequest,
+    coding_agent_initial::CodingAgentInitialRequest,
+};
 use git::{ConflictOp, GitCliError, GitServiceError};
 use serde::{Deserialize, Serialize};
 use services::services::{container::ContainerService, diff_stream, remote_sync};
@@ -59,6 +67,13 @@ pub enum GitOperationError {
 #[derive(Debug, Deserialize, Serialize, TS)]
 pub struct MergeWorkspaceRequest {
     pub repo_id: Uuid,
+}
+
+#[derive(Debug, Serialize, Deserialize, TS)]
+pub struct MergeWorkspaceResponse {
+    /// True when an agent is generating the commit message and the merge will
+    /// complete asynchronously; false when the merge already completed inline.
+    pub generating: bool,
 }
 
 #[derive(Debug, Deserialize, Serialize, TS)]
@@ -180,7 +195,7 @@ pub async fn merge_workspace(
     Extension(workspace): Extension<Workspace>,
     State(deployment): State<DeploymentImpl>,
     Json(request): Json<MergeWorkspaceRequest>,
-) -> Result<ResponseJson<ApiResponse<()>>, ApiError> {
+) -> Result<ResponseJson<ApiResponse<MergeWorkspaceResponse>>, ApiError> {
     let pool = &deployment.db().pool;
 
     let workspace_repo =
@@ -221,48 +236,207 @@ pub async fn merge_workspace(
 
     let workspace_label = workspace.name.as_deref().unwrap_or(&workspace.branch);
     let vk_id = resolve_vibe_kanban_identifier(&deployment, workspace.id).await;
-    let commit_message = format!("{} (vibe-kanban {})", workspace_label, vk_id);
+    let fallback_message = format!("{} (vibe-kanban {})", workspace_label, vk_id);
 
-    let merge_commit_id = deployment.git().merge_changes(
-        &repo.path,
-        &worktree_path,
-        &workspace.branch,
-        &workspace_repo.target_branch,
-        &commit_message,
-    )?;
-
-    Merge::create_direct(
-        pool,
-        workspace.id,
-        workspace_repo.repo_id,
-        &workspace_repo.target_branch,
-        &merge_commit_id,
-    )
-    .await?;
-
-    if let Ok(client) = deployment.remote_client() {
-        let workspace_id = workspace.id;
-        tokio::spawn(async move {
-            remote_sync::sync_local_workspace_merge_to_remote(&client, workspace_id).await;
-        });
-    }
-
-    if !workspace.pinned
-        && let Err(e) = deployment.container().archive_workspace(workspace.id).await
-    {
-        tracing::error!("Failed to archive workspace {}: {}", workspace.id, e);
-    }
-
-    deployment
-        .track_if_analytics_allowed(
-            "task_attempt_merged",
-            serde_json::json!({
-                "workspace_id": workspace.id.to_string(),
+    let (enabled, prompt_template) = {
+        let config = deployment.config().read().await;
+        (
+            config.merge_commit_message_enabled,
+            config.merge_commit_prompt.clone().unwrap_or_else(|| {
+                services::services::config::DEFAULT_MERGE_COMMIT_PROMPT.to_string()
             }),
         )
-        .await;
+    };
 
-    Ok(ResponseJson(ApiResponse::success(())))
+    if !enabled {
+        // Unchanged synchronous merge path.
+        let merge_commit_id = deployment.git().merge_changes(
+            &repo.path,
+            &worktree_path,
+            &workspace.branch,
+            &workspace_repo.target_branch,
+            &fallback_message,
+        )?;
+
+        Merge::create_direct(
+            pool,
+            workspace.id,
+            workspace_repo.repo_id,
+            &workspace_repo.target_branch,
+            &merge_commit_id,
+        )
+        .await?;
+
+        if let Ok(client) = deployment.remote_client() {
+            let workspace_id = workspace.id;
+            tokio::spawn(async move {
+                remote_sync::sync_local_workspace_merge_to_remote(&client, workspace_id).await;
+            });
+        }
+
+        if !workspace.pinned
+            && let Err(e) = deployment.container().archive_workspace(workspace.id).await
+        {
+            tracing::error!("Failed to archive workspace {}: {}", workspace.id, e);
+        }
+
+        deployment
+            .track_if_analytics_allowed(
+                "task_attempt_merged",
+                serde_json::json!({
+                    "workspace_id": workspace.id.to_string(),
+                }),
+            )
+            .await;
+
+        return Ok(ResponseJson(ApiResponse::success(MergeWorkspaceResponse {
+            generating: false,
+        })));
+    }
+
+    // Resolve task title/description for placeholders.
+    let (task_title, task_description) = if let Some(task_id) = workspace.task_id {
+        match Task::find_by_id(pool, task_id).await? {
+            Some(task) => (task.title, task.description.unwrap_or_default()),
+            None => (workspace_label.to_string(), String::new()),
+        }
+    } else {
+        (workspace_label.to_string(), String::new())
+    };
+
+    // Message file lives in the workspace container root (the parent of the repo
+    // worktrees), NOT inside the repo worktree. The container root is not a git
+    // repo, so the file is invisible to the executor's commit-reminder / git-status
+    // checks during the generation run — it can never be committed into the branch
+    // being squash-merged, and the commit reminder won't nag the agent about it.
+    // Removed after reading in `complete_merge_commit_message`.
+    let message_file =
+        workspace_path.join(format!(".vk-merge-commit-msg-{}.txt", workspace_repo.repo_id));
+
+    let prompt = services::services::merge_commit::build_merge_commit_prompt(
+        &prompt_template,
+        &services::services::merge_commit::MergePromptFields {
+            task_title: &task_title,
+            task_description: &task_description,
+            branch: &workspace.branch,
+            target_branch: &workspace_repo.target_branch,
+            vk_id: &vk_id,
+            message_file: &message_file.to_string_lossy(),
+        },
+    );
+
+    // Get-or-create a session + executor profile, mirroring trigger_pr_description_follow_up.
+    let session = match Session::find_latest_by_workspace_id(pool, workspace.id).await? {
+        Some(s) => s,
+        None => {
+            Session::create(
+                pool,
+                &CreateSession {
+                    executor: None,
+                    name: None,
+                },
+                Uuid::new_v4(),
+                workspace.id,
+            )
+            .await?
+        }
+    };
+
+    let Some(executor_profile_id) =
+        ExecutionProcess::latest_executor_profile_for_session(pool, session.id).await?
+    else {
+        // No agent has run here; fall back to a synchronous default merge.
+        let merge_commit_id = deployment.git().merge_changes(
+            &repo.path,
+            &worktree_path,
+            &workspace.branch,
+            &workspace_repo.target_branch,
+            &fallback_message,
+        )?;
+        Merge::create_direct(
+            pool,
+            workspace.id,
+            workspace_repo.repo_id,
+            &workspace_repo.target_branch,
+            &merge_commit_id,
+        )
+        .await?;
+
+        if let Ok(client) = deployment.remote_client() {
+            let workspace_id = workspace.id;
+            tokio::spawn(async move {
+                remote_sync::sync_local_workspace_merge_to_remote(&client, workspace_id).await;
+            });
+        }
+
+        if !workspace.pinned {
+            let _ = deployment.container().archive_workspace(workspace.id).await;
+        }
+
+        deployment
+            .track_if_analytics_allowed(
+                "task_attempt_merged",
+                serde_json::json!({
+                    "workspace_id": workspace.id.to_string(),
+                }),
+            )
+            .await;
+
+        return Ok(ResponseJson(ApiResponse::success(MergeWorkspaceResponse {
+            generating: false,
+        })));
+    };
+
+    let latest_session_info = CodingAgentTurn::find_latest_session_info(pool, session.id).await?;
+    // Run the generation agent in the selected repo's worktree so its git commands
+    // operate on the repo being merged. `session.agent_working_dir` may be None
+    // (workspace root, not a git repo) or point at a different repo in multi-repo
+    // workspaces, which would generate a message from the wrong diff or none at all.
+    let working_dir = Some(worktree_path.to_string_lossy().to_string());
+
+    let action_type = if let Some(info) = latest_session_info {
+        ExecutorActionType::CodingAgentFollowUpRequest(CodingAgentFollowUpRequest {
+            prompt,
+            session_id: info.session_id,
+            reset_to_message_id: None,
+            executor_config: executors::profile::ExecutorConfig::from(executor_profile_id.clone()),
+            working_dir: working_dir.clone(),
+        })
+    } else {
+        ExecutorActionType::CodingAgentInitialRequest(CodingAgentInitialRequest {
+            prompt,
+            executor_config: executors::profile::ExecutorConfig::from(executor_profile_id.clone()),
+            working_dir,
+        })
+    };
+    let action = ExecutorAction::new(action_type, None);
+
+    let execution_process = deployment
+        .container()
+        .start_execution(
+            &workspace,
+            &session,
+            &action,
+            &ExecutionProcessRunReason::MergeCommitMessage,
+        )
+        .await?;
+
+    deployment.container().register_pending_merge(
+        execution_process.id,
+        services::services::merge_commit::PendingMerge {
+            repo_id: workspace_repo.repo_id,
+            repo_path: repo.path.clone(),
+            worktree_path: worktree_path.clone(),
+            source_branch: workspace.branch.clone(),
+            target_branch: workspace_repo.target_branch.clone(),
+            message_file,
+            fallback_message,
+        },
+    );
+
+    Ok(ResponseJson(ApiResponse::success(MergeWorkspaceResponse {
+        generating: true,
+    })))
 }
 
 pub async fn push_workspace_branch(

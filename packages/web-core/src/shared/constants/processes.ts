@@ -6,6 +6,7 @@ export const PROCESS_RUN_REASONS = {
   CLEANUP_SCRIPT: 'cleanupscript' as ExecutionProcessRunReason,
   ARCHIVE_SCRIPT: 'archivescript' as ExecutionProcessRunReason,
   CODING_AGENT: 'codingagent' as ExecutionProcessRunReason,
+  MERGE_COMMIT_MESSAGE: 'mergecommitmessage' as ExecutionProcessRunReason,
   DEV_SERVER: 'devserver' as ExecutionProcessRunReason,
 } as const;
 

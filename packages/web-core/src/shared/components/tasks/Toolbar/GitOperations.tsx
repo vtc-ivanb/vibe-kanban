@@ -62,6 +62,7 @@ function GitOperations({
   const [pushing, setPushing] = useState(false);
   const [rebasing, setRebasing] = useState(false);
   const [mergeSuccess, setMergeSuccess] = useState(false);
+  const [mergeGenerating, setMergeGenerating] = useState(false);
   const [pushSuccess, setPushSuccess] = useState(false);
 
   // Target branch change handlers
@@ -146,9 +147,10 @@ function GitOperations({
 
   const mergeButtonLabel = useMemo(() => {
     if (mergeSuccess) return t('git.states.merged');
+    if (mergeGenerating) return t('git.states.generatingCommitMessage');
     if (merging) return t('git.states.merging');
     return t('git.states.merge');
-  }, [mergeSuccess, merging, t]);
+  }, [mergeSuccess, mergeGenerating, merging, t]);
 
   const rebaseButtonLabel = useMemo(() => {
     if (rebasing) return t('git.states.rebasing');
@@ -189,11 +191,22 @@ function GitOperations({
       setMerging(true);
       const repoId = getSelectedRepoId();
       if (!repoId) return;
-      await git.actions.merge({
+      const result = await git.actions.merge({
         repoId,
       });
-      setMergeSuccess(true);
-      setTimeout(() => setMergeSuccess(false), 2000);
+      if (result.generating) {
+        // An agent is generating the commit message; the merge will complete
+        // asynchronously. The workspace will archive when done — same signal
+        // as a normal merge. Show a transient "generating" state on the button.
+        setMergeGenerating(true);
+        // The workspace will archive when the agent finishes; clear the
+        // generating indicator after a generous timeout as a safety net.
+        setTimeout(() => setMergeGenerating(false), 30000);
+      } else {
+        // Merge completed synchronously — show success state briefly.
+        setMergeSuccess(true);
+        setTimeout(() => setMergeSuccess(false), 2000);
+      }
     } finally {
       setMerging(false);
     }
@@ -474,6 +487,7 @@ function GitOperations({
                 mergeInfo.hasMergedPR ||
                 mergeInfo.hasOpenPR ||
                 merging ||
+                mergeGenerating ||
                 hasConflictsCalculated ||
                 isAttemptRunning ||
                 selectedRepoStatus?.is_target_remote ||

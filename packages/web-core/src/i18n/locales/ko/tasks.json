@@ -139,6 +139,7 @@
     "states": {
       "merged": "병합됨!",
       "merging": "병합 중...",
+      "generatingCommitMessage": "커밋 메시지 생성 중…",
       "merge": "병합",
       "rebasing": "리베이스 중...",
       "rebase": "리베이스",

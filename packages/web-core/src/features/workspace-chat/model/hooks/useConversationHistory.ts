@@ -431,7 +431,9 @@ export const useConversationHistory = ({
       );
       const allInitialEntries = await loadHistoricEntries(MIN_INITIAL_ENTRIES);
       if (cancelled) return;
-      console.debug(`[conv-history] loadHistoricEntries DONE scope=${scopeKey}`);
+      console.debug(
+        `[conv-history] loadHistoricEntries DONE scope=${scopeKey}`
+      );
       loadedInitialEntries.current = true;
       mergeIntoDisplayed((state) => {
         Object.assign(state, allInitialEntries);

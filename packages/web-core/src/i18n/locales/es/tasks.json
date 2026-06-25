@@ -188,6 +188,7 @@
       "merge": "Fusionar",
       "merged": "¡Fusionado!",
       "merging": "Fusionando...",
+      "generatingCommitMessage": "Generando mensaje de commit…",
       "push": "Enviar",
       "pushed": "¡Enviado!",
       "pushing": "Enviando...",

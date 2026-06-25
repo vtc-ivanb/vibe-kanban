@@ -168,7 +168,7 @@ dropped: boolean, started_at: string, completed_at: string | null, created_at: s
 
 export enum ExecutionProcessStatus { running = "running", completed = "completed", failed = "failed", killed = "killed" }
 
-export type ExecutionProcessRunReason = "setupscript" | "cleanupscript" | "archivescript" | "codingagent" | "devserver";
+export type ExecutionProcessRunReason = "setupscript" | "cleanupscript" | "archivescript" | "codingagent" | "devserver" | "mergecommitmessage";
 
 export type ExecutionProcessRepoState = { id: string, execution_process_id: string, repo_id: string, before_head_commit: string | null, after_head_commit: string | null, merge_commit: string | null, created_at: Date, updated_at: Date, };
 
@@ -321,6 +321,13 @@ export type AddWorkspaceRepoRequest = { repo_id: string, target_branch: string, 
 export type AddWorkspaceRepoResponse = { workspace: Workspace, repo: RepoWithTargetBranch, };
 
 export type MergeWorkspaceRequest = { repo_id: string, };
+
+export type MergeWorkspaceResponse = { 
+/**
+ * True when an agent is generating the commit message and the merge will
+ * complete asynchronously; false when the merge already completed inline.
+ */
+generating: boolean, };
 
 export type PushWorkspaceRequest = { repo_id: string, };
 
@@ -488,7 +495,7 @@ export type DirectoryListResponse = { entries: Array<DirectoryEntry>, current_pa
 
 export type SearchMode = "taskform" | "settings";
 
-export type Config = { config_version: string, theme: ThemeMode, executor_profile: ExecutorProfileId, disclaimer_acknowledged: boolean, onboarding_acknowledged: boolean, remote_onboarding_acknowledged: boolean, notifications: NotificationConfig, editor: EditorConfig, github: GitHubConfig, analytics_enabled: boolean, workspace_dir: string | null, last_app_version: string | null, show_release_notes: boolean, language: UiLanguage, git_branch_prefix: string, showcases: ShowcaseState, pr_auto_description_enabled: boolean, pr_auto_description_prompt: string | null, commit_reminder_enabled: boolean, commit_reminder_prompt: string | null, send_message_shortcut: SendMessageShortcut, relay_enabled: boolean, host_nickname: string | null, };
+export type Config = { config_version: string, theme: ThemeMode, executor_profile: ExecutorProfileId, disclaimer_acknowledged: boolean, onboarding_acknowledged: boolean, remote_onboarding_acknowledged: boolean, notifications: NotificationConfig, editor: EditorConfig, github: GitHubConfig, analytics_enabled: boolean, workspace_dir: string | null, last_app_version: string | null, show_release_notes: boolean, language: UiLanguage, git_branch_prefix: string, showcases: ShowcaseState, pr_auto_description_enabled: boolean, pr_auto_description_prompt: string | null, commit_reminder_enabled: boolean, commit_reminder_prompt: string | null, merge_commit_message_enabled: boolean, merge_commit_prompt: string | null, send_message_shortcut: SendMessageShortcut, relay_enabled: boolean, host_nickname: string | null, };
 
 export type NotificationConfig = { sound_enabled: boolean, push_enabled: boolean, sound_file: SoundFile, };
 
@@ -886,3 +893,5 @@ session_id: string, };
 export const DEFAULT_PR_DESCRIPTION_PROMPT = "Update the PR that was just created with a better title and description.\nThe PR number is #{pr_number} and the URL is {pr_url}.\n\nAnalyze the changes in this branch and write:\n1. A concise, descriptive title that summarizes the changes, postfixed with \"(Vibe Kanban)\"\n2. A detailed description that explains:\n   - What changes were made\n   - Why they were made (based on the task context)\n   - Any important implementation details\n   - At the end, include a note: \"This PR was written using [Vibe Kanban](https://vibekanban.com)\"\n\nUse the appropriate CLI tool to update the PR (gh pr edit for GitHub, az repos pr update for Azure DevOps).";
 
 export const DEFAULT_COMMIT_REMINDER_PROMPT = "There are uncommitted changes. Please stage and commit them now with a descriptive commit message.";
+
+export const DEFAULT_MERGE_COMMIT_PROMPT = "You are writing the git commit message for a squash merge of the current branch into its base branch.\n\nInspect the changes (e.g. run `git log {target_branch}..{branch}` and `git diff {target_branch}...{branch}`) and write a clear, well-formed commit message:\n- First line: a concise summary in the imperative mood (aim for <= 72 chars).\n- Then a blank line, then a body explaining WHAT changed and WHY. Use bullet points where helpful.\n\nContext:\n- Task title: {task_title}\n- Task description: {task_description}\n- Branch: {branch}\n- Vibe Kanban ID: {vk_id}\n\nWrite ONLY the final commit message (no commentary, no markdown code fences) to this file, overwriting it if it exists:\n{message_file}\n\nDo NOT run `git commit`, do NOT stage anything, and do NOT modify any tracked files. Your only file output is the message file above.";

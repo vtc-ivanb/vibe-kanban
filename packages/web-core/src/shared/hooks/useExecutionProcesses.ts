@@ -77,7 +77,8 @@ export const useExecutionProcesses = (
       (process.run_reason === 'codingagent' ||
         process.run_reason === 'setupscript' ||
         process.run_reason === 'cleanupscript' ||
-        process.run_reason === 'archivescript') &&
+        process.run_reason === 'archivescript' ||
+        process.run_reason === 'mergecommitmessage') &&
       process.status === 'running'
   );
   const isLoading = !!sessionId && !isInitialized && !error; // until first snapshot

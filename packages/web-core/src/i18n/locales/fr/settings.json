@@ -191,6 +191,18 @@
           "helper": "Prompt personnalisé pour le rappel de commit. Le statut git sera ajouté automatiquement."
         }
       },
+      "mergeCommit": {
+        "title": "Message de commit de fusion",
+        "description": "Faire générer le message de commit par un agent lors de la fusion.",
+        "enabled": {
+          "label": "Générer le message de commit avec un agent",
+          "helper": "Lors de la fusion, un agent rédige un message de commit avec titre et corps. Revient au message par défaut si la génération échoue."
+        },
+        "customPrompt": {
+          "useCustom": "Utiliser un prompt personnalisé",
+          "helper": "Variables disponibles : {task_title}, {task_description}, {branch}, {target_branch}, {vk_id}, {message_file}."
+        }
+      },
       "notifications": {
         "title": "Notifications",
         "description": "Contrôlez quand et comment vous recevez des notifications.",

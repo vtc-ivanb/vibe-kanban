@@ -22,6 +22,23 @@ Use the appropriate CLI tool to update the PR (gh pr edit for GitHub, az repos p
 
 pub const DEFAULT_COMMIT_REMINDER_PROMPT: &str = "There are uncommitted changes. Please stage and commit them now with a descriptive commit message.";
 
+pub const DEFAULT_MERGE_COMMIT_PROMPT: &str = r#"You are writing the git commit message for a squash merge of the current branch into its base branch.
+
+Inspect the changes (e.g. run `git log {target_branch}..{branch}` and `git diff {target_branch}...{branch}`) and write a clear, well-formed commit message:
+- First line: a concise summary in the imperative mood (aim for <= 72 chars).
+- Then a blank line, then a body explaining WHAT changed and WHY. Use bullet points where helpful.
+
+Context:
+- Task title: {task_title}
+- Task description: {task_description}
+- Branch: {branch}
+- Vibe Kanban ID: {vk_id}
+
+Write ONLY the final commit message (no commentary, no markdown code fences) to this file, overwriting it if it exists:
+{message_file}
+
+Do NOT run `git commit`, do NOT stage anything, and do NOT modify any tracked files. Your only file output is the message file above."#;
+
 #[derive(Debug, Error)]
 pub enum ConfigError {
     #[error(transparent)]
