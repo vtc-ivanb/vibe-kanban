@@ -426,10 +426,18 @@ impl DiffStreamManager {
     }
 
     async fn handle_git_state_change(&mut self) -> Result<(), DiffStreamError> {
-        if self.is_child_of_current_head().await {
-            return Ok(()); // Simple commit — reconcile handles via forced discovery
-        }
-        // Non-commit (checkout/reset/rebase) — debounce reset to batch rapid HEAD changes
+        // Any HEAD change — commit, checkout, reset, rebase — schedules a
+        // debounced full reset so the whole worktree is re-read against base.
+        //
+        // A child commit is the signal that a coding-agent run just finished
+        // (vibe-kanban auto-commits on completion). We intentionally do a full
+        // re-diff here rather than deferring to the reconcile's forced
+        // discovery: that discovery only re-diffs files flagged by the
+        // (mtime, len) stat check or newly appeared, so an already-tracked file
+        // whose edit was missed by the filesystem watcher AND left no detectable
+        // stat delta would otherwise stay stale until the next stream reset
+        // (i.e. until the user switches tasks and back). The debounce batches
+        // rapid/multi-repo commits into a single reset.
         self.pending_reset_since = Some(tokio::time::Instant::now());
         Ok(())
     }
