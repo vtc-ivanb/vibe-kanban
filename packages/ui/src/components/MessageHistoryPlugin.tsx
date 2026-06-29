@@ -5,6 +5,7 @@ import {
   $getRoot,
   $getSelection,
   $isRangeSelection,
+  COMMAND_PRIORITY_CRITICAL,
   COMMAND_PRIORITY_LOW,
   KEY_ARROW_DOWN_COMMAND,
   KEY_ARROW_UP_COMMAND,
@@ -38,6 +39,9 @@ type Props = {
 export function MessageHistoryPlugin({ history, transformers }: Props) {
   const [editor] = useLexicalComposerContext();
   const { isOpen: isTypeaheadOpen } = useTypeaheadOpen();
+
+  // TEMP DIAGNOSTICS — remove once history recall is confirmed working.
+  console.info('[MsgHistory] render, history.length =', history.length);
 
   // Mirror the latest props/state into refs so the registered commands, which
   // are only attached once, always read fresh values.
@@ -90,6 +94,19 @@ export function MessageHistoryPlugin({ history, transformers }: Props) {
       return true;
     };
 
+    // Whether ArrowUp should start walking history. An empty editor always
+    // qualifies — note that an empty editor frequently has no RangeSelection at
+    // all (the root is cleared to zero children), so we must check emptiness
+    // before requiring a caret.
+    const $canEnterHistory = (): boolean => {
+      if ($getRoot().getTextContent().length === 0) return true;
+      const selection = $getSelection();
+      if (!$isRangeSelection(selection) || !selection.isCollapsed()) {
+        return false;
+      }
+      return $isCaretOnFirstLine(selection);
+    };
+
     // Replaces the editor content. Must run inside an editor update context
     // (command listeners already provide one).
     const $applyMarkdown = (markdown: string) => {
@@ -105,23 +122,26 @@ export function MessageHistoryPlugin({ history, transformers }: Props) {
     };
 
     const $navigate = (direction: 'older' | 'newer'): boolean => {
+      // TEMP DIAGNOSTICS — remove once confirmed working.
+      console.info('[MsgHistory] $navigate', direction, {
+        typeaheadOpen: typeaheadOpenRef.current,
+        historyLen: historyRef.current.length,
+        pos: positionRef.current,
+        canEnter: direction === 'older' ? $canEnterHistory() : null,
+      });
+
       if (typeaheadOpenRef.current) return false;
 
       const hist = historyRef.current;
       if (hist.length === 0) return false;
 
-      // Only act on a collapsed caret; never hijack a range selection.
-      const selection = $getSelection();
-      if (!$isRangeSelection(selection) || !selection.isCollapsed()) {
-        return false;
-      }
-
       const pos = positionRef.current;
 
       if (direction === 'older') {
         // Entering history requires the caret to be on the first line, so that
-        // ArrowUp still moves between lines of a multi-line draft.
-        if (pos === 0 && !$isCaretOnFirstLine(selection)) return false;
+        // ArrowUp still moves between lines of a multi-line draft. Once we're
+        // already walking history (pos > 0) we own the buffer and keep going.
+        if (pos === 0 && !$canEnterHistory()) return false;
         // Already at the oldest entry — consume the key so the caret stays put.
         if (pos >= hist.length) return pos > 0;
 
@@ -165,10 +185,23 @@ export function MessageHistoryPlugin({ history, transformers }: Props) {
       }
     );
 
+    // TEMP DIAGNOSTICS — a non-consuming probe at the highest priority tells us
+    // whether ArrowUp reaches the editor's command layer at all (independent of
+    // any lower-priority interception). Remove once confirmed working.
+    const unregisterProbe = editor.registerCommand(
+      KEY_ARROW_UP_COMMAND,
+      () => {
+        console.info('[MsgHistory] ArrowUp reached editor (CRITICAL probe)');
+        return false;
+      },
+      COMMAND_PRIORITY_CRITICAL
+    );
+
     const unregisterUp = editor.registerCommand(
       KEY_ARROW_UP_COMMAND,
       (event: KeyboardEvent | null) => {
         const handled = $navigate('older');
+        console.info('[MsgHistory] ArrowUp handler result:', handled);
         if (handled) event?.preventDefault();
         return handled;
       },
@@ -187,6 +220,7 @@ export function MessageHistoryPlugin({ history, transformers }: Props) {
 
     return () => {
       unregisterUpdate();
+      unregisterProbe();
       unregisterUp();
       unregisterDown();
     };

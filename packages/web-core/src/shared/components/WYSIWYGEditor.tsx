@@ -596,12 +596,12 @@ const WYSIWYGEditor = forwardRef<WYSIWYGEditorRef, WysiwygProps>(
                         transformers={allTransformers}
                         sendShortcut={sendShortcut}
                       />
-                      {messageHistory && messageHistory.length > 0 && (
-                        <MessageHistoryPlugin
-                          history={messageHistory}
-                          transformers={allTransformers}
-                        />
-                      )}
+                      {/* TEMP DIAGNOSTICS: always mount so it logs history.length
+                          even when empty. Restore the `length > 0` guard after. */}
+                      <MessageHistoryPlugin
+                        history={messageHistory ?? []}
+                        transformers={allTransformers}
+                      />
                     </TypeaheadOpenProvider>
                     <ImageKeyboardPlugin isTargetNode={$isImageNode} />
                     <ComponentInfoKeyboardPlugin

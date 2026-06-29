@@ -321,6 +321,19 @@ export function SessionChatBoxContainer(props: SessionChatBoxContainerProps) {
     return result;
   }, [userMessageTurns]);
 
+  // TEMP DIAGNOSTICS — remove once history recall is confirmed working.
+  useEffect(() => {
+    console.info(
+      '[MsgHistory] container: entries=',
+      entries.length,
+      'userMessageTurns=',
+      userMessageTurns.length,
+      'messageHistory=',
+      messageHistory.length,
+      messageHistory.map((m) => m.slice(0, 40))
+    );
+  }, [entries.length, userMessageTurns, messageHistory]);
+
   // Execution state
   const { isAttemptRunning, stopExecution, isStopping, processes } =
     useWorkspaceExecution(workspaceId);
