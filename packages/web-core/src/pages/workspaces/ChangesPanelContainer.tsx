@@ -11,7 +11,11 @@ import {
   Virtualizer,
   WorkerPoolContextProvider,
 } from '@pierre/diffs/react';
-import type { DiffLineAnnotation, AnnotationSide } from '@pierre/diffs';
+import type {
+  DiffLineAnnotation,
+  AnnotationSide,
+  VirtualFileMetrics,
+} from '@pierre/diffs';
 const WorkerUrl = new URL(
   '@pierre/diffs/worker/worker-portable.js',
   import.meta.url
@@ -85,6 +89,74 @@ function shouldAutoCollapse(diff: Diff): boolean {
 
 const IS_MOBILE = isRealMobileDevice();
 const NOOP = () => {};
+
+// Pierre's built-in size estimates (line 20px, header 44px, etc). These rarely
+// match our themed CSS, so we measure the real geometry once and override them.
+const FALLBACK_METRICS: VirtualFileMetrics = {
+  hunkLineCount: 50,
+  lineHeight: 20,
+  diffHeaderHeight: 44,
+  hunkSeparatorHeight: 32,
+  fileGap: 8,
+};
+
+// Cached for the session so subsequent mounts render with correct metrics from
+// the first frame (no remount). Geometry only depends on font/theme CSS, which
+// is stable within a session.
+let cachedMetrics: VirtualFileMetrics | null = null;
+
+// Read the real rendered line/header/separator heights from a live diff so the
+// virtualizer's size estimates match the DOM. Returns null until at least one
+// expanded diff has rendered a measurable line.
+function measureDiffMetrics(
+  scrollRoot: HTMLElement
+): VirtualFileMetrics | null {
+  let diffHeaderHeight = 0;
+  let lineHeight = 0;
+  let hunkSeparatorHeight = 0;
+
+  for (const container of Array.from(
+    scrollRoot.querySelectorAll('diffs-container')
+  )) {
+    const shadow = container.shadowRoot;
+    if (!shadow) continue;
+
+    if (diffHeaderHeight <= 0) {
+      const header = shadow.querySelector('[data-diffs-header]');
+      if (header instanceof HTMLElement) {
+        diffHeaderHeight = header.getBoundingClientRect().height;
+      }
+    }
+    if (lineHeight <= 0) {
+      const line = shadow.querySelector('[data-line][data-line-index]');
+      if (line instanceof HTMLElement) {
+        lineHeight = line.getBoundingClientRect().height;
+      }
+    }
+    if (hunkSeparatorHeight <= 0) {
+      const separator = shadow.querySelector('[data-separator]');
+      if (separator instanceof HTMLElement) {
+        hunkSeparatorHeight = separator.getBoundingClientRect().height;
+      }
+    }
+    if (diffHeaderHeight > 0 && lineHeight > 0) break;
+  }
+
+  // A code line is the one geometry we can't fall back on — without it the
+  // estimate is meaningless, so wait for a rendered line before committing.
+  if (diffHeaderHeight <= 0 || lineHeight <= 0) return null;
+
+  return {
+    hunkLineCount: FALLBACK_METRICS.hunkLineCount,
+    lineHeight,
+    diffHeaderHeight,
+    hunkSeparatorHeight:
+      hunkSeparatorHeight > 0
+        ? hunkSeparatorHeight
+        : FALLBACK_METRICS.hunkSeparatorHeight,
+    fileGap: FALLBACK_METRICS.fileGap,
+  };
+}
 
 const PIERRE_DIFFS_THEME_CSS = `
   :host {
@@ -316,12 +388,14 @@ interface DiffFileItemProps {
   diff: Diff;
   initialExpanded: boolean;
   workspaceId: string;
+  metrics?: VirtualFileMetrics;
 }
 
 const DiffFileItem = memo(function DiffFileItem({
   diff,
   initialExpanded,
   workspaceId,
+  metrics,
 }: DiffFileItemProps) {
   const { t } = useTranslation('common');
   const filePath = diff.newPath || diff.oldPath || '';
@@ -577,6 +651,7 @@ const DiffFileItem = memo(function DiffFileItem({
       <FileDiff<ExtendedCommentAnnotation>
         fileDiff={fileDiffMetadata}
         options={options}
+        metrics={metrics}
         lineAnnotations={annotations}
         renderAnnotation={annotations ? renderAnnotation : undefined}
         renderHeaderPrefix={renderHeaderPrefix}
@@ -602,6 +677,9 @@ export const ChangesPanelContainer = memo(function ChangesPanelContainer({
   const { registerScrollToFile } = useChangesView();
   const [processedPaths] = useState(() => new Set<string>());
   const [mountedCount, setMountedCount] = useState(0);
+  const [metrics, setMetrics] = useState<VirtualFileMetrics | null>(
+    cachedMetrics
+  );
   const rafRef = useRef<number | null>(null);
 
   const diffItems = useMemo(() => {
@@ -791,6 +869,66 @@ export const ChangesPanelContainer = memo(function ChangesPanelContainer({
     };
   }, [hasItems]);
 
+  // Measure real line/header geometry once a diff has rendered, then feed it to
+  // the virtualizer via `metrics`. Pierre skips DOM measurement in our default
+  // (no-wrap) mode and trusts its built-in size estimates; when those don't
+  // match our themed CSS the scroll-anchor correction fights the user and the
+  // scroll snaps back. Measuring once keeps the fast path but with real numbers.
+  useEffect(() => {
+    if (metrics !== null || !hasItems) return;
+    let raf = 0;
+    let attempts = 0;
+    let settled = false;
+
+    const tryMeasure = () => {
+      if (settled) return;
+      const firstWrapper = document.querySelector('[data-diff-path]');
+      const scrollRoot =
+        firstWrapper instanceof HTMLElement
+          ? firstWrapper.closest('.overflow-auto')
+          : null;
+      const measured =
+        scrollRoot instanceof HTMLElement
+          ? measureDiffMetrics(scrollRoot)
+          : null;
+      if (measured) {
+        settled = true;
+        cachedMetrics = measured;
+        setMetrics(measured);
+        return;
+      }
+      // Lines render asynchronously (worker highlighting); retry for a short
+      // window before giving up and leaving the built-in estimates in place.
+      if (++attempts < 30) {
+        raf = requestAnimationFrame(tryMeasure);
+      }
+    };
+
+    const startMeasuring = () => {
+      if (settled) return;
+      cancelAnimationFrame(raf);
+      attempts = 0;
+      raf = requestAnimationFrame(tryMeasure);
+    };
+
+    startMeasuring();
+
+    // If every initially-rendered file is auto-collapsed (e.g. deleted/renamed
+    // or large diffs) there is no code line to measure and the retry window
+    // expires on defaults. Expanding a file only updates the store, which does
+    // not re-run this effect, so subscribe and re-measure once a file expands.
+    const unsubscribe = useUiPreferencesStore.subscribe((state, prev) => {
+      if (settled || state.expanded === prev.expanded) return;
+      startMeasuring();
+    });
+
+    return () => {
+      settled = true;
+      cancelAnimationFrame(raf);
+      unsubscribe();
+    };
+  }, [metrics, hasItems]);
+
   const handleScrollToFile = useCallback(
     (path: string, lineNumber?: number) => {
       const expandKey = `diff:${path}`;
@@ -867,10 +1005,13 @@ export const ChangesPanelContainer = memo(function ChangesPanelContainer({
           const path = diff.newPath || diff.oldPath || '';
           return (
             <DiffFileItem
-              key={path}
+              // Key flips once when measured metrics arrive, remounting each
+              // FileDiff so it picks up the metrics (read only at construction).
+              key={metrics ? `${path} measured` : path}
               diff={diff}
               initialExpanded={initialExpanded}
               workspaceId={workspaceId}
+              metrics={metrics ?? undefined}
             />
           );
         })}
