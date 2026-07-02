@@ -62,7 +62,7 @@ fn base_command(claude_code_router: bool) -> &'static str {
     if claude_code_router {
         "npx -y @musistudio/claude-code-router@1.0.66 code"
     } else {
-        "npx -y @anthropic-ai/claude-code@2.1.185"
+        "npx -y @anthropic-ai/claude-code@2.1.198"
     }
 }
 
@@ -272,12 +272,14 @@ fn default_discovered_options() -> crate::executor_discovery::ExecutorDiscovered
     let effort_options =
         ReasoningOption::from_names(["low", "medium", "high", "xhigh", "max"].map(String::from));
 
-    let supports_effort = |id: &str| -> bool { id.contains("opus") || id.contains("sonnet") };
+    let supports_effort =
+        |id: &str| -> bool { id.contains("opus") || id.contains("sonnet") || id.contains("fable") };
 
     ExecutorDiscoveredOptions {
         model_selector: ModelSelectorConfig {
             providers: vec![],
             models: [
+                ("fable", "Fable"),
                 ("opus", "Opus"),
                 ("opus[1m]", "Opus (1M context)"),
                 ("sonnet", "Sonnet"),

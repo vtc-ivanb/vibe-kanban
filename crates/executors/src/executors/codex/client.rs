@@ -5,19 +5,20 @@ use std::{
         Arc, OnceLock,
         atomic::{AtomicBool, Ordering},
     },
+    time::{SystemTime, UNIX_EPOCH},
 };
 
 use async_trait::async_trait;
 use codex_app_server_protocol::{
     ClientInfo, ClientNotification, ClientRequest, CommandExecutionApprovalDecision,
     CommandExecutionRequestApprovalResponse, ConfigBatchWriteParams, ConfigEdit, ConfigReadParams,
-    ConfigReadResponse, ConfigWriteResponse, DynamicToolCallOutputContentItem,
-    DynamicToolCallResponse, FileChangeApprovalDecision, FileChangeRequestApprovalResponse,
-    GetAccountParams, GetAccountRateLimitsResponse, GetAccountResponse, InitializeCapabilities,
-    InitializeParams, InitializeResponse, ItemCompletedNotification, JSONRPCError,
-    JSONRPCNotification, JSONRPCRequest, JSONRPCResponse, ListMcpServerStatusParams,
-    ListMcpServerStatusResponse, McpServerStatusDetail, RequestId, ReviewStartParams,
-    ReviewStartResponse, ReviewTarget, ServerRequest, ThreadCompactStartParams,
+    ConfigReadResponse, ConfigWriteResponse, CurrentTimeReadResponse,
+    DynamicToolCallOutputContentItem, DynamicToolCallResponse, FileChangeApprovalDecision,
+    FileChangeRequestApprovalResponse, GetAccountParams, GetAccountRateLimitsResponse,
+    GetAccountResponse, InitializeCapabilities, InitializeParams, InitializeResponse,
+    ItemCompletedNotification, JSONRPCError, JSONRPCNotification, JSONRPCRequest, JSONRPCResponse,
+    ListMcpServerStatusParams, ListMcpServerStatusResponse, McpServerStatusDetail, RequestId,
+    ReviewStartParams, ReviewStartResponse, ReviewTarget, ServerRequest, ThreadCompactStartParams,
     ThreadCompactStartResponse, ThreadForkParams, ThreadForkResponse, ThreadItem, ThreadReadParams,
     ThreadReadResponse, ThreadStartParams, ThreadStartResponse, ToolRequestUserInputAnswer,
     ToolRequestUserInputQuestion, ToolRequestUserInputResponse, TurnCompletedNotification,
@@ -410,6 +411,17 @@ impl AppServerClient {
                         answers: HashMap::new(),
                     },
                 };
+                send_server_response(peer, request_id, response).await?;
+                Ok(())
+            }
+            ServerRequest::CurrentTimeRead { request_id, .. } => {
+                // Codex delegates its clock to the client; respond with the
+                // current wall-clock time in whole Unix seconds.
+                let current_time_at = SystemTime::now()
+                    .duration_since(UNIX_EPOCH)
+                    .map(|d| d.as_secs() as i64)
+                    .unwrap_or(0);
+                let response = CurrentTimeReadResponse { current_time_at };
                 send_server_response(peer, request_id, response).await?;
                 Ok(())
             }

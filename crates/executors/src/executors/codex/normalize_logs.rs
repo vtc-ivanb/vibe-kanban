@@ -2403,7 +2403,8 @@ pub fn normalize_logs(
                 | EventMsg::ThreadGoalUpdated(..)
                 | EventMsg::ThreadSettingsApplied(..)
                 | EventMsg::TurnModerationMetadata(..)
-                | EventMsg::SubAgentActivity(..) => {}
+                | EventMsg::SubAgentActivity(..)
+                | EventMsg::SafetyBuffering(..) => {}
             }
         }
     });
