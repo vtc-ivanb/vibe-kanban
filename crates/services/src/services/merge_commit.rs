@@ -1,5 +1,6 @@
 use std::path::PathBuf;
 
+use executors::profile::ExecutorProfileId;
 use uuid::Uuid;
 
 #[derive(Clone, Debug)]
@@ -40,6 +41,18 @@ pub fn select_merge_commit_message(generated: Option<String>, fallback: &str) ->
     }
 }
 
+/// Whether the merge-commit-message generation can resume the workspace's
+/// existing agent session instead of cold-starting a new one.
+///
+/// The generation always runs as the configured default coding agent. Resuming
+/// is only valid when the workspace's most recent coding agent uses the same
+/// executor as `default`; a different executor's session format is incompatible
+/// (e.g. you cannot resume a Codex session with Claude). The variant/model is
+/// ignored — it only selects a model, which resume handles fine.
+pub fn can_resume_session(latest: Option<&ExecutorProfileId>, default: &ExecutorProfileId) -> bool {
+    latest.map(|l| &l.executor) == Some(&default.executor)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -75,5 +88,24 @@ mod tests {
             "fb"
         );
         assert_eq!(select_merge_commit_message(None, "fb"), "fb");
+    }
+
+    #[test]
+    fn resume_only_when_executor_matches() {
+        use executors::executors::BaseCodingAgent;
+
+        let default = ExecutorProfileId::new(BaseCodingAgent::ClaudeCode);
+
+        // Same executor, different variant → resumable (variant only picks a model).
+        let same_executor =
+            ExecutorProfileId::with_variant(BaseCodingAgent::ClaudeCode, "PLAN".to_string());
+        assert!(can_resume_session(Some(&same_executor), &default));
+
+        // Different executor → not resumable.
+        let other = ExecutorProfileId::new(BaseCodingAgent::Codex);
+        assert!(!can_resume_session(Some(&other), &default));
+
+        // No prior agent in the workspace → not resumable.
+        assert!(!can_resume_session(None, &default));
     }
 }

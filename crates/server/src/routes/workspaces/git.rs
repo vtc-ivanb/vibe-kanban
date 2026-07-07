@@ -190,6 +190,65 @@ pub async fn stream_diff_ws(
     stream_workspace_diff_ws(ws, query, workspace, deployment).await
 }
 
+/// Performs a squash merge using `fallback_message` and records it, mirroring
+/// the synchronous (non-generated) merge path. Used both when message
+/// generation is disabled and as a graceful fallback when the generation agent
+/// cannot be started, so a merge never fails just because message generation
+/// was unavailable.
+async fn merge_with_fallback_message(
+    deployment: &DeploymentImpl,
+    workspace: &Workspace,
+    repo: &Repo,
+    workspace_repo: &WorkspaceRepo,
+    worktree_path: &Path,
+    fallback_message: &str,
+) -> Result<ResponseJson<ApiResponse<MergeWorkspaceResponse>>, ApiError> {
+    let pool = &deployment.db().pool;
+
+    let merge_commit_id = deployment.git().merge_changes(
+        &repo.path,
+        worktree_path,
+        &workspace.branch,
+        &workspace_repo.target_branch,
+        fallback_message,
+    )?;
+
+    Merge::create_direct(
+        pool,
+        workspace.id,
+        workspace_repo.repo_id,
+        &workspace_repo.target_branch,
+        &merge_commit_id,
+    )
+    .await?;
+
+    if let Ok(client) = deployment.remote_client() {
+        let workspace_id = workspace.id;
+        tokio::spawn(async move {
+            remote_sync::sync_local_workspace_merge_to_remote(&client, workspace_id).await;
+        });
+    }
+
+    if !workspace.pinned
+        && let Err(e) = deployment.container().archive_workspace(workspace.id).await
+    {
+        tracing::error!("Failed to archive workspace {}: {}", workspace.id, e);
+    }
+
+    deployment
+        .track_if_analytics_allowed(
+            "task_attempt_merged",
+            serde_json::json!({
+                "workspace_id": workspace.id.to_string(),
+            }),
+        )
+        .await;
+
+    Ok(ResponseJson(ApiResponse::success(MergeWorkspaceResponse {
+        generating: false,
+    })))
+}
+
 #[axum::debug_handler]
 pub async fn merge_workspace(
     Extension(workspace): Extension<Workspace>,
@@ -232,66 +291,36 @@ pub async fn merge_workspace(
         .ensure_container_exists(&workspace)
         .await?;
     let workspace_path = Path::new(&container_ref);
-    let worktree_path = workspace_path.join(repo.name);
+    let worktree_path = workspace_path.join(&repo.name);
 
     let workspace_label = workspace.name.as_deref().unwrap_or(&workspace.branch);
     let vk_id = resolve_vibe_kanban_identifier(&deployment, workspace.id).await;
     let fallback_message = format!("{} (vibe-kanban {})", workspace_label, vk_id);
 
-    let (enabled, prompt_template) = {
+    let (enabled, prompt_template, default_profile) = {
         let config = deployment.config().read().await;
         (
             config.merge_commit_message_enabled,
             config.merge_commit_prompt.clone().unwrap_or_else(|| {
                 services::services::config::DEFAULT_MERGE_COMMIT_PROMPT.to_string()
             }),
+            // The generation runs as the configured "Default Coding Agent",
+            // independent of whatever agent last ran in the workspace.
+            config.executor_profile.clone(),
         )
     };
 
     if !enabled {
-        // Unchanged synchronous merge path.
-        let merge_commit_id = deployment.git().merge_changes(
-            &repo.path,
+        // Message generation is off; merge synchronously with the default message.
+        return merge_with_fallback_message(
+            &deployment,
+            &workspace,
+            &repo,
+            &workspace_repo,
             &worktree_path,
-            &workspace.branch,
-            &workspace_repo.target_branch,
             &fallback_message,
-        )?;
-
-        Merge::create_direct(
-            pool,
-            workspace.id,
-            workspace_repo.repo_id,
-            &workspace_repo.target_branch,
-            &merge_commit_id,
         )
-        .await?;
-
-        if let Ok(client) = deployment.remote_client() {
-            let workspace_id = workspace.id;
-            tokio::spawn(async move {
-                remote_sync::sync_local_workspace_merge_to_remote(&client, workspace_id).await;
-            });
-        }
-
-        if !workspace.pinned
-            && let Err(e) = deployment.container().archive_workspace(workspace.id).await
-        {
-            tracing::error!("Failed to archive workspace {}: {}", workspace.id, e);
-        }
-
-        deployment
-            .track_if_analytics_allowed(
-                "task_attempt_merged",
-                serde_json::json!({
-                    "workspace_id": workspace.id.to_string(),
-                }),
-            )
-            .await;
-
-        return Ok(ResponseJson(ApiResponse::success(MergeWorkspaceResponse {
-            generating: false,
-        })));
+        .await;
     }
 
     // Resolve task title/description for placeholders.
@@ -310,8 +339,10 @@ pub async fn merge_workspace(
     // checks during the generation run — it can never be committed into the branch
     // being squash-merged, and the commit reminder won't nag the agent about it.
     // Removed after reading in `complete_merge_commit_message`.
-    let message_file =
-        workspace_path.join(format!(".vk-merge-commit-msg-{}.txt", workspace_repo.repo_id));
+    let message_file = workspace_path.join(format!(
+        ".vk-merge-commit-msg-{}.txt",
+        workspace_repo.repo_id
+    ));
 
     let prompt = services::services::merge_commit::build_merge_commit_prompt(
         &prompt_template,
@@ -342,50 +373,18 @@ pub async fn merge_workspace(
         }
     };
 
-    let Some(executor_profile_id) =
-        ExecutionProcess::latest_executor_profile_for_session(pool, session.id).await?
-    else {
-        // No agent has run here; fall back to a synchronous default merge.
-        let merge_commit_id = deployment.git().merge_changes(
-            &repo.path,
-            &worktree_path,
-            &workspace.branch,
-            &workspace_repo.target_branch,
-            &fallback_message,
-        )?;
-        Merge::create_direct(
-            pool,
-            workspace.id,
-            workspace_repo.repo_id,
-            &workspace_repo.target_branch,
-            &merge_commit_id,
-        )
-        .await?;
-
-        if let Ok(client) = deployment.remote_client() {
-            let workspace_id = workspace.id;
-            tokio::spawn(async move {
-                remote_sync::sync_local_workspace_merge_to_remote(&client, workspace_id).await;
-            });
-        }
-
-        if !workspace.pinned {
-            let _ = deployment.container().archive_workspace(workspace.id).await;
-        }
-
-        deployment
-            .track_if_analytics_allowed(
-                "task_attempt_merged",
-                serde_json::json!({
-                    "workspace_id": workspace.id.to_string(),
-                }),
-            )
-            .await;
-
-        return Ok(ResponseJson(ApiResponse::success(MergeWorkspaceResponse {
-            generating: false,
-        })));
-    };
+    // Decide whether we can resume the workspace's existing agent session. The
+    // generation always runs as the configured default coding agent; when the
+    // workspace's most recent agent already uses that executor we resume its
+    // session (cheaper, and keeps the task context loaded), otherwise we
+    // cold-start a fresh session with the default agent. A workspace where no
+    // agent ever ran also cold-starts.
+    let latest_profile =
+        ExecutionProcess::latest_executor_profile_for_session(pool, session.id).await?;
+    let can_resume = services::services::merge_commit::can_resume_session(
+        latest_profile.as_ref(),
+        &default_profile,
+    );
 
     let latest_session_info = CodingAgentTurn::find_latest_session_info(pool, session.id).await?;
     // Run the generation agent in the selected repo's worktree so its git commands
@@ -394,24 +393,28 @@ pub async fn merge_workspace(
     // workspaces, which would generate a message from the wrong diff or none at all.
     let working_dir = Some(worktree_path.to_string_lossy().to_string());
 
-    let action_type = if let Some(info) = latest_session_info {
-        ExecutorActionType::CodingAgentFollowUpRequest(CodingAgentFollowUpRequest {
+    let action_type = match (can_resume, latest_session_info) {
+        (true, Some(info)) => {
+            ExecutorActionType::CodingAgentFollowUpRequest(CodingAgentFollowUpRequest {
+                prompt,
+                session_id: info.session_id,
+                reset_to_message_id: None,
+                executor_config: executors::profile::ExecutorConfig::from(default_profile.clone()),
+                working_dir: working_dir.clone(),
+            })
+        }
+        _ => ExecutorActionType::CodingAgentInitialRequest(CodingAgentInitialRequest {
             prompt,
-            session_id: info.session_id,
-            reset_to_message_id: None,
-            executor_config: executors::profile::ExecutorConfig::from(executor_profile_id.clone()),
-            working_dir: working_dir.clone(),
-        })
-    } else {
-        ExecutorActionType::CodingAgentInitialRequest(CodingAgentInitialRequest {
-            prompt,
-            executor_config: executors::profile::ExecutorConfig::from(executor_profile_id.clone()),
+            executor_config: executors::profile::ExecutorConfig::from(default_profile.clone()),
             working_dir,
-        })
+        }),
     };
     let action = ExecutorAction::new(action_type, None);
 
-    let execution_process = deployment
+    // If the default agent cannot be started (not installed, not logged in,
+    // invalid profile, ...), don't fail the merge — fall back to a synchronous
+    // merge with the default commit message.
+    let execution_process = match deployment
         .container()
         .start_execution(
             &workspace,
@@ -419,7 +422,26 @@ pub async fn merge_workspace(
             &action,
             &ExecutionProcessRunReason::MergeCommitMessage,
         )
-        .await?;
+        .await
+    {
+        Ok(execution_process) => execution_process,
+        Err(e) => {
+            tracing::warn!(
+                "Failed to start merge-commit-message generation for workspace {}: {e}; \
+                 merging with the default commit message",
+                workspace.id
+            );
+            return merge_with_fallback_message(
+                &deployment,
+                &workspace,
+                &repo,
+                &workspace_repo,
+                &worktree_path,
+                &fallback_message,
+            )
+            .await;
+        }
+    };
 
     deployment.container().register_pending_merge(
         execution_process.id,
