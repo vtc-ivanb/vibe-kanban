@@ -1,4 +1,5 @@
 // SDK submodules
+pub mod background;
 pub mod client;
 pub mod protocol;
 pub mod slash_commands;
@@ -2806,6 +2807,21 @@ mod tests {
             entries[0].content,
             "System initialized with model: claude-sonnet-4-20250514"
         );
+    }
+
+    #[test]
+    fn test_waiting_status_renders_as_system_message() {
+        // The waiting marker the read loop emits when it parks on a background
+        // task must render as a system message in the normalized timeline.
+        let json = r#"{"type":"system","subtype":"status","status":"⏳ Waiting for background task to finish…"}"#;
+        let parsed: ClaudeJson = serde_json::from_str(json).unwrap();
+        let entries = normalize(&parsed, "");
+        assert_eq!(entries.len(), 1);
+        assert!(matches!(
+            entries[0].entry_type,
+            NormalizedEntryType::SystemMessage
+        ));
+        assert!(entries[0].content.contains("Waiting for background task"));
     }
 
     #[test]
