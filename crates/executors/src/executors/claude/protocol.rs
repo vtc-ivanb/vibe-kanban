@@ -196,7 +196,15 @@ impl ProtocolPeer {
                 {
                     Ok(hook_output) => {
                         if let Err(e) = self.send_hook_response(request_id, hook_output).await {
-                            tracing::error!("Failed to send hook callback result: {e}");
+                            // A write failure while the session is being torn down is a benign
+                            // race (the CLI stream is already closing), not an error worth surfacing.
+                            if client.is_cancelled() {
+                                tracing::debug!(
+                                    "Hook callback result not delivered during teardown: {e}"
+                                );
+                            } else {
+                                tracing::error!("Failed to send hook callback result: {e}");
+                            }
                         }
                     }
                     Err(e) => {

@@ -57,6 +57,12 @@ impl ClaudeAgentClient {
         })
     }
 
+    /// Whether the session is being torn down (user stop / cancellation).
+    /// Used to keep late control-protocol writes non-fatal during shutdown.
+    pub fn is_cancelled(&self) -> bool {
+        self.cancel.is_cancelled()
+    }
+
     async fn handle_approval(
         &self,
         tool_use_id: String,
@@ -328,6 +334,13 @@ impl ClaudeAgentClient {
     ) -> Result<serde_json::Value, ExecutorError> {
         // Stop hook git check - uses `decision` (approve/block) and `reason` fields
         if callback_id == STOP_GIT_CHECK_CALLBACK_ID {
+            // During teardown/cancellation the SDK stream is already closing. Running the
+            // (potentially slow) git status check and replying just races the shutdown and
+            // provokes a spurious "Stream closed" error from the CLI. Approve immediately so
+            // the hook roundtrip closes cleanly.
+            if self.cancel.is_cancelled() {
+                return Ok(serde_json::json!({"decision": "approve"}));
+            }
             if input
                 .get("stop_hook_active")
                 .and_then(|v| v.as_bool())

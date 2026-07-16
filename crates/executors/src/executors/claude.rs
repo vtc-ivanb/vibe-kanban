@@ -1799,6 +1799,8 @@ impl ClaudeLogProcessor {
                 model_usage,
                 subtype,
                 result,
+                num_turns,
+                origin,
                 ..
             } => {
                 // get the real model context window and correct the context usage entry
@@ -1812,7 +1814,19 @@ impl ClaudeLogProcessor {
                     patches.push(self.add_token_usage_entry(entry_index_provider));
                 }
 
-                if matches!(self.strategy, HistoryStrategy::AmpResume) && is_error.unwrap_or(false)
+                // A zero-turn run whose only trigger was a background-task completion
+                // notification (no user prompt, no assistant output) must not surface as a
+                // turn — it renders as an empty/broken assistant message. This happens when a
+                // previous session was torn down while a background task was still outstanding
+                // (see keep-alive handling in claude/protocol.rs).
+                let empty_bg_continuation = *num_turns == Some(0)
+                    && origin.as_ref().and_then(|o| o.kind.as_deref())
+                        == Some("task-notification");
+
+                if empty_bg_continuation {
+                    // nothing to surface
+                } else if matches!(self.strategy, HistoryStrategy::AmpResume)
+                    && is_error.unwrap_or(false)
                 {
                     let entry = NormalizedEntry {
                         timestamp: None,
@@ -2345,6 +2359,11 @@ pub enum ClaudeJson {
         model_usage: Option<HashMap<String, ClaudeModelUsage>>,
         #[serde(default)]
         usage: Option<ClaudeUsage>,
+        /// What triggered this run. A `task-notification` origin means the run was
+        /// auto-continued only to deliver a background-task completion notification,
+        /// not by a user prompt.
+        #[serde(default)]
+        origin: Option<ClaudeResultOrigin>,
     },
     ApprovalRequested {
         tool_call_id: String,
@@ -2520,6 +2539,14 @@ pub struct ClaudeUsage {
 pub struct ClaudeModelUsage {
     #[serde(default)]
     pub context_window: Option<u32>,
+}
+
+/// What triggered a `result` message. `kind` is `"task-notification"` when the run
+/// was auto-continued only to deliver a background-task completion notification.
+#[derive(Deserialize, Serialize, Debug, Clone, PartialEq, Default)]
+pub struct ClaudeResultOrigin {
+    #[serde(default)]
+    pub kind: Option<String>,
 }
 
 /// Structured tool data for Claude tools based on real samples
@@ -2850,6 +2877,21 @@ mod tests {
             NormalizedEntryType::AssistantMessage
         ));
         assert_eq!(entries[0].content, "Final result");
+    }
+
+    #[test]
+    fn test_empty_background_task_notification_result_is_suppressed() {
+        // A zero-turn run auto-continued only to deliver a background-task completion
+        // notification carries an empty result and origin.kind == "task-notification".
+        // It must not surface as an (empty) assistant message.
+        let result_json = r#"{"type":"result","subtype":"success","is_error":false,"duration_ms":254,"num_turns":0,"result":"","origin":{"kind":"task-notification"}}"#;
+        let parsed: ClaudeJson = serde_json::from_str(result_json).unwrap();
+
+        let entries = normalize(&parsed, "");
+        assert!(
+            entries.is_empty(),
+            "empty task-notification continuation should produce no entries, got: {entries:?}"
+        );
     }
 
     #[test]
