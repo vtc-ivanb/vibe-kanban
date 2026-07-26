@@ -328,6 +328,30 @@ impl StandardCodingAgentExecutor for Codex {
             model_selector: ModelSelectorConfig {
                 models: vec![
                     ModelInfo {
+                        id: "gpt-5.6-sol".to_string(),
+                        name: "GPT-5.6 Sol".to_string(),
+                        provider_id: None,
+                        reasoning_options: xhigh_reasoning_options.clone(),
+                    },
+                    ModelInfo {
+                        id: "gpt-5.6-sol-fast".to_string(),
+                        name: "GPT-5.6 Sol Fast".to_string(),
+                        provider_id: None,
+                        reasoning_options: xhigh_reasoning_options.clone(),
+                    },
+                    ModelInfo {
+                        id: "gpt-5.6-terra".to_string(),
+                        name: "GPT-5.6 Terra".to_string(),
+                        provider_id: None,
+                        reasoning_options: xhigh_reasoning_options.clone(),
+                    },
+                    ModelInfo {
+                        id: "gpt-5.6-luna".to_string(),
+                        name: "GPT-5.6 Luna".to_string(),
+                        provider_id: None,
+                        reasoning_options: xhigh_reasoning_options.clone(),
+                    },
+                    ModelInfo {
                         id: "gpt-5.5".to_string(),
                         name: "GPT-5.5".to_string(),
                         provider_id: None,
@@ -439,7 +463,7 @@ impl StandardCodingAgentExecutor for Codex {
 
 impl Codex {
     pub fn base_command() -> &'static str {
-        "npx -y @openai/codex@0.142.5"
+        "npx -y @openai/codex@0.145.0"
     }
 
     fn build_command_builder(&self) -> Result<CommandBuilder, CommandBuildError> {
@@ -467,7 +491,9 @@ impl Codex {
             }
             None => None,
             Some(AskForApproval::UnlessTrusted) => Some(V2AskForApproval::UnlessTrusted),
-            Some(AskForApproval::OnFailure) => Some(V2AskForApproval::OnFailure),
+            // Codex folded the old on-failure policy into on-request in the v2
+            // app-server protocol.
+            Some(AskForApproval::OnFailure) => Some(V2AskForApproval::OnRequest),
             Some(AskForApproval::OnRequest) => Some(V2AskForApproval::OnRequest),
             Some(AskForApproval::Never) => Some(V2AskForApproval::Never),
         };
