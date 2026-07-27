@@ -88,6 +88,14 @@ make_zip() {
 export VK_SHARED_API_BASE="https://api.vibekanban.com"
 export VITE_VK_SHARED_API_BASE="https://api.vibekanban.com"
 
+# The web app build (vite + react-compiler + sourcemaps) needs more heap than
+# Node's default (~2GB on machines with <=8GB RAM), or `vite build` OOMs. CI
+# sets the same value; mirror it here so local builds don't depend on the
+# invoking environment. Respect an existing NODE_OPTIONS if the caller set one.
+if [[ "$NODE_OPTIONS" != *"--max-old-space-size"* ]]; then
+  export NODE_OPTIONS="${NODE_OPTIONS:+$NODE_OPTIONS }--max-old-space-size=8192"
+fi
+
 echo "🧹 Cleaning previous builds..."
 rm -rf npx-cli/dist
 mkdir -p npx-cli/dist/$PLATFORM
