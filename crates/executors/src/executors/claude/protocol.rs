@@ -19,20 +19,6 @@ use crate::{
     },
 };
 
-/// Whether a `Result` message should end the read loop.
-///
-/// Normally the turn only ends once no background tasks are outstanding, so the
-/// session stays alive across `run_in_background` work and auto-continues. But
-/// once cancellation has been requested (`interrupted`), the user is stopping
-/// the session, so any `Result` ends it promptly rather than waiting on a
-/// background task that will be force-killed anyway.
-pub(crate) fn should_end_turn(
-    interrupted: bool,
-    outstanding: &std::collections::HashSet<String>,
-) -> bool {
-    interrupted || outstanding.is_empty()
-}
-
 /// Handles bidirectional control protocol communication
 #[derive(Clone)]
 pub struct ProtocolPeer {
@@ -74,6 +60,10 @@ impl ProtocolPeer {
         // non-empty we keep the session alive past a `Result` so Claude's harness
         // can deliver the completion notification and auto-continue the turn.
         let mut outstanding: std::collections::HashSet<String> = std::collections::HashSet::new();
+        // Terminal notifications Claude replayed for tasks a previous, torn-down
+        // process had left running. Each is answered by its own zero-turn `Result`
+        // ahead of our queued prompt, and must not end the turn.
+        let mut replayed_notifications: usize = 0;
         // Whether we have already emitted the "waiting" marker for the current
         // parked interval. Reset once the outstanding set drains so a later
         // background task announces again.
@@ -103,8 +93,15 @@ impl ProtocolPeer {
 
                             // Track outstanding background tasks so a `Result` while
                             // one is still running does not end the session.
-                            if let Ok(v) = serde_json::from_str::<serde_json::Value>(line) {
-                                super::background::apply_task_event(&mut outstanding, &v);
+                            if let Ok(v) = serde_json::from_str::<serde_json::Value>(line)
+                                && super::background::apply_task_event(&mut outstanding, &v)
+                                    == super::background::TaskEvent::Replayed
+                            {
+                                replayed_notifications += 1;
+                                tracing::warn!(
+                                    "Claude replayed a background-task notification from a \
+                                     previous session; its empty result will not end this turn"
+                                );
                             }
                             if outstanding.is_empty() {
                                 waiting_announced = false;
@@ -119,20 +116,33 @@ impl ProtocolPeer {
                                     self.handle_control_request(&client, request_id, request)
                                         .await;
                                 }
-                                Ok(CLIMessage::Result(_)) => {
-                                    if should_end_turn(interrupt_sent, &outstanding) {
-                                        break;
-                                    }
-                                    // A background task is still running: keep stdin open
-                                    // and keep reading. Claude fires `task_notification` on
-                                    // completion and auto-continues to a final `Result`.
-                                    if !waiting_announced {
-                                        waiting_announced = true;
-                                        let _ = client
-                                            .log_message(
-                                                r#"{"type":"system","subtype":"status","status":"⏳ Waiting for background task to finish…"}"#,
-                                            )
-                                            .await;
+                                Ok(CLIMessage::Result(result)) => {
+                                    match super::background::on_result(
+                                        interrupt_sent,
+                                        &outstanding,
+                                        replayed_notifications,
+                                        &result,
+                                    ) {
+                                        super::background::TurnAction::End => break,
+                                        // This result only answered a replayed
+                                        // notification; our prompt is still queued
+                                        // behind it, so keep reading for its answer.
+                                        super::background::TurnAction::SkipReplayed => {
+                                            replayed_notifications -= 1;
+                                        }
+                                        // A background task is still running: keep stdin open
+                                        // and keep reading. Claude fires `task_notification` on
+                                        // completion and auto-continues to a final `Result`.
+                                        super::background::TurnAction::AwaitBackground => {
+                                            if !waiting_announced {
+                                                waiting_announced = true;
+                                                let _ = client
+                                                    .log_message(
+                                                        r#"{"type":"system","subtype":"status","status":"⏳ Waiting for background task to finish…"}"#,
+                                                    )
+                                                    .await;
+                                            }
+                                        }
                                     }
                                 }
                                 _ => {}
@@ -269,29 +279,5 @@ impl ProtocolPeer {
             SDKControlRequestType::SetPermissionMode { mode },
         ))
         .await
-    }
-}
-
-#[cfg(test)]
-mod tests {
-    use std::collections::HashSet;
-
-    use super::*;
-
-    #[test]
-    fn result_final_only_when_no_outstanding() {
-        let mut out: HashSet<String> = HashSet::new();
-        assert!(should_end_turn(false, &out));
-        out.insert("t1".to_string());
-        assert!(!should_end_turn(false, &out));
-    }
-
-    #[test]
-    fn interrupt_ends_turn_even_with_outstanding_tasks() {
-        let mut out: HashSet<String> = HashSet::new();
-        out.insert("t1".to_string());
-        // A stop request must end the session on the next Result rather than
-        // waiting on a background task that will be force-killed anyway.
-        assert!(should_end_turn(true, &out));
     }
 }
