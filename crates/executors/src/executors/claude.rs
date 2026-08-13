@@ -1799,6 +1799,7 @@ impl ClaudeLogProcessor {
                 model_usage,
                 subtype,
                 result,
+                error,
                 num_turns,
                 origin,
                 ..
@@ -1824,16 +1825,20 @@ impl ClaudeLogProcessor {
 
                 if empty_bg_continuation {
                     // nothing to surface
-                } else if matches!(self.strategy, HistoryStrategy::AmpResume)
-                    && is_error.unwrap_or(false)
-                {
+                } else if is_error.unwrap_or(false) {
+                    let result_text = result.as_ref().and_then(|v| v.as_str());
+                    let error_type = match classify_claude_api_error(result_text, error.as_deref())
+                    {
+                        ClaudeApiErrorClass::Retryable => NormalizedEntryError::RetryableApiError,
+                        ClaudeApiErrorClass::Fatal => NormalizedEntryError::Other,
+                    };
+                    let content = result_text.map(|s| s.to_string()).unwrap_or_else(|| {
+                        serde_json::to_string(claude_json).unwrap_or_else(|_| "error".to_string())
+                    });
                     let entry = NormalizedEntry {
                         timestamp: None,
-                        entry_type: NormalizedEntryType::ErrorMessage {
-                            error_type: NormalizedEntryError::Other,
-                        },
-                        content: serde_json::to_string(claude_json)
-                            .unwrap_or_else(|_| "error".to_string()),
+                        entry_type: NormalizedEntryType::ErrorMessage { error_type },
+                        content,
                         metadata: Some(
                             serde_json::to_value(claude_json).unwrap_or(serde_json::Value::Null),
                         ),
@@ -2780,6 +2785,89 @@ impl ClaudeToolData {
     }
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum ClaudeApiErrorClass {
+    Retryable,
+    Fatal,
+}
+
+/// True if `code` (a 3-digit HTTP status) appears in `haystack` as a standalone
+/// token — not preceded or followed by another ASCII digit.
+fn mentions_status_code(haystack: &str, code: &str) -> bool {
+    let bytes = haystack.as_bytes();
+    let mut start = 0;
+    while let Some(pos) = haystack[start..].find(code) {
+        let i = start + pos;
+        let before_ok = i == 0 || !bytes[i - 1].is_ascii_digit();
+        let after = i + code.len();
+        let after_ok = after >= bytes.len() || !bytes[after].is_ascii_digit();
+        if before_ok && after_ok {
+            return true;
+        }
+        start = i + 1;
+    }
+    false
+}
+
+/// Classify a terminal Claude `result` (with `is_error: true`) as a transient
+/// error worth auto-resuming, or a fatal one that must not be retried.
+///
+/// Fatal wins on any fatal signal, and anything unrecognized is Fatal so we
+/// never loop on an unknown error.
+pub(crate) fn classify_claude_api_error(
+    result_text: Option<&str>,
+    error_field: Option<&str>,
+) -> ClaudeApiErrorClass {
+    let haystack = format!(
+        "{} {}",
+        result_text.unwrap_or_default(),
+        error_field.unwrap_or_default()
+    )
+    .to_lowercase();
+
+    const FATAL_KEYWORDS: &[&str] = &[
+        "authentication_error",
+        "authentication_failed",
+        "oauth token has expired",
+        "invalid_request",
+        "prompt is too long",
+        "credit balance",
+        "billing",
+    ];
+    const FATAL_STATUS_CODES: &[&str] = &["401", "403", "400"];
+
+    const RETRYABLE_KEYWORDS: &[&str] = &[
+        "stalled mid-stream",
+        "response stalled",
+        "overloaded",
+        "internal server error",
+        "timed out",
+        "timeout",
+        "connection error",
+        "rate limit",
+        "service unavailable",
+    ];
+    const RETRYABLE_STATUS_CODES: &[&str] = &["429", "500", "503", "529"];
+
+    let is_fatal = FATAL_KEYWORDS.iter().any(|p| haystack.contains(p))
+        || FATAL_STATUS_CODES
+            .iter()
+            .any(|code| mentions_status_code(&haystack, code));
+    if is_fatal {
+        return ClaudeApiErrorClass::Fatal;
+    }
+
+    let is_retryable = RETRYABLE_KEYWORDS.iter().any(|p| haystack.contains(p))
+        || RETRYABLE_STATUS_CODES
+            .iter()
+            .any(|code| mentions_status_code(&haystack, code));
+    if is_retryable {
+        return ClaudeApiErrorClass::Retryable;
+    }
+
+    ClaudeApiErrorClass::Fatal
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -2910,6 +2998,23 @@ mod tests {
         assert!(
             entries.is_empty(),
             "empty task-notification continuation should produce no entries, got: {entries:?}"
+        );
+    }
+
+    #[test]
+    fn stall_result_emits_retryable_error_entry() {
+        let result_json = r#"{"type":"result","subtype":"success","is_error":true,"num_turns":1,"result":"API Error: Response stalled mid-stream. The response above may be incomplete."}"#;
+        let parsed: ClaudeJson = serde_json::from_str(result_json).unwrap();
+
+        let entries = normalize(&parsed, "");
+        assert!(
+            entries.iter().any(|e| matches!(
+                &e.entry_type,
+                NormalizedEntryType::ErrorMessage {
+                    error_type: NormalizedEntryError::RetryableApiError
+                }
+            )),
+            "expected a RetryableApiError entry, got: {entries:?}"
         );
     }
 
@@ -3362,5 +3467,70 @@ mod tests {
         let control_request_json = r#"{"type":"control_request","request_id":"f559d907-b139-475b-addd-79c05591eb99","request":{"subtype":"can_use_tool","tool_name":"Bash","input":{"command":"./gradlew :web:testApi","timeout":300000,"description":"Run API tests"},"permission_suggestions":[{"type":"addRules","rules":[{"toolName":"Bash","ruleContent":"./gradlew :web:testApi:"}],"behavior":"allow","destination":"localSettings"}],"tool_use_id":"toolu_014PR3WXsJfiftSCbjcjEbeM"}}"#;
         let parsed: ClaudeJson = serde_json::from_str(control_request_json).unwrap();
         assert!(matches!(parsed, ClaudeJson::ControlRequest { .. }));
+    }
+
+    #[test]
+    fn classifies_stall_as_retryable() {
+        let class = classify_claude_api_error(
+            Some("API Error: Response stalled mid-stream. The response above may be incomplete."),
+            None,
+        );
+        assert_eq!(class, ClaudeApiErrorClass::Retryable);
+    }
+
+    #[test]
+    fn classifies_overloaded_as_retryable() {
+        let class = classify_claude_api_error(Some("API Error: 529 overloaded_error"), None);
+        assert_eq!(class, ClaudeApiErrorClass::Retryable);
+    }
+
+    #[test]
+    fn classifies_auth_error_as_fatal() {
+        // Real capture: a 401 mid-turn.
+        let class = classify_claude_api_error(
+            Some(
+                "Failed to authenticate. API Error: 401 {\"type\":\"error\",\"error\":{\"type\":\"authentication_error\",\"message\":\"OAuth token has expired.\"}}",
+            ),
+            Some("authentication_failed"),
+        );
+        assert_eq!(class, ClaudeApiErrorClass::Fatal);
+    }
+
+    #[test]
+    fn classifies_prompt_too_long_as_fatal() {
+        let class = classify_claude_api_error(Some("API Error: 400 prompt is too long"), None);
+        assert_eq!(class, ClaudeApiErrorClass::Fatal);
+    }
+
+    #[test]
+    fn classifies_unknown_as_fatal() {
+        let class = classify_claude_api_error(Some("some entirely unexpected error"), None);
+        assert_eq!(class, ClaudeApiErrorClass::Fatal);
+    }
+
+    #[test]
+    fn fatal_status_at_string_start_wins_over_retryable() {
+        // 401 at position 0, plus a retryable phrase later — must be Fatal.
+        assert_eq!(
+            classify_claude_api_error(Some("401 unauthorized; connection timed out"), None),
+            ClaudeApiErrorClass::Fatal
+        );
+    }
+
+    #[test]
+    fn classifies_rate_limit_as_retryable() {
+        assert_eq!(
+            classify_claude_api_error(Some("API Error: 429 rate limit exceeded"), None),
+            ClaudeApiErrorClass::Retryable
+        );
+    }
+
+    #[test]
+    fn benign_number_does_not_match_status_code() {
+        // "4000" must NOT match fatal "400"; the stall phrase makes it Retryable.
+        assert_eq!(
+            classify_claude_api_error(Some("stalled mid-stream after 4000 tokens"), None),
+            ClaudeApiErrorClass::Retryable
+        );
     }
 }

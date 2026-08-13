@@ -64,6 +64,9 @@ pub struct NormalizedConversation {
 #[serde(tag = "type", rename_all = "snake_case")]
 pub enum NormalizedEntryError {
     SetupRequired,
+    /// A transient API-layer error the agent turn can be safely auto-resumed from
+    /// (e.g. a mid-stream stall, overload, or timeout).
+    RetryableApiError,
     Other,
 }
 

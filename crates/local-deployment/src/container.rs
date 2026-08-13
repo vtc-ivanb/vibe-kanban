@@ -35,7 +35,10 @@ use executors::{
     approvals::{ExecutorApprovalService, NoopExecutorApprovalService},
     env::{ExecutionEnv, RepoContext},
     executors::{BaseCodingAgent, CancellationToken, ExecutorExitResult, ExecutorExitSignal},
-    logs::{NormalizedEntryType, utils::patch::extract_normalized_entry_from_patch},
+    logs::{
+        NormalizedEntryError, NormalizedEntryType,
+        utils::patch::extract_normalized_entry_from_patch,
+    },
 };
 use futures::{FutureExt, TryStreamExt, stream::select};
 use git::GitService;
@@ -65,6 +68,17 @@ use workspace_manager::{RepoWorkspaceInput, WorkspaceError, WorkspaceManager};
 use crate::{command, copy, pty::PtyService};
 
 const WORKSPACE_TOUCH_DEBOUNCE: Duration = Duration::from_mins(2);
+
+/// Maximum number of consecutive auto-continue follow-ups allowed for a
+/// single session before we give up and finalize as failed.
+const MAX_AUTO_CONTINUE_RETRIES: u32 = 3;
+/// Backoff before resuming a session after a transient API stall.
+const AUTO_CONTINUE_BACKOFF: Duration = Duration::from_secs(2);
+
+/// True while the auto-continue chain is still under the retry cap.
+fn under_retry_cap(attempts: u32) -> bool {
+    attempts < MAX_AUTO_CONTINUE_RETRIES
+}
 
 #[derive(Clone)]
 pub struct LocalContainerService {
@@ -647,6 +661,95 @@ impl LocalContainerService {
                         }
                     }
 
+                    // Auto-continue transient Claude API stalls (e.g. "Response stalled mid-stream").
+                    let is_claude = ctx
+                        .execution_process
+                        .executor_action()
+                        .ok()
+                        .and_then(|a| a.base_executor())
+                        == Some(BaseCodingAgent::ClaudeCode);
+
+                    let auto_continue_enabled =
+                        { config.read().await.auto_continue_on_api_stall_enabled };
+
+                    // A retryable stall is a transient interruption, not a genuine failure:
+                    // the CLI gave up mid-turn on a recoverable API error. Both the
+                    // auto-continue path and the queued-message path key off this.
+                    let ended_in_retryable_stall = is_claude
+                        && matches!(
+                            ctx.execution_process.run_reason,
+                            ExecutionProcessRunReason::CodingAgent
+                        )
+                        && matches!(ctx.execution_process.status, ExecutionProcessStatus::Failed)
+                        && container.last_turn_ended_in_retryable_stall(&exec_id);
+
+                    if !already_finalized
+                        && auto_continue_enabled
+                        && ended_in_retryable_stall
+                        && !container.queued_message_service.has_queued(ctx.session.id)
+                    {
+                        // `consecutive_auto_continue_count` counts auto-continues STRICTLY BEFORE
+                        // exec_id. The just-failed process is itself an auto-continue from the 2nd
+                        // stall onward, so count it too — otherwise the chain overshoots the cap by
+                        // one (4 spawned instead of 3).
+                        let prior = container
+                            .consecutive_auto_continue_count(ctx.session.id, exec_id)
+                            .await;
+                        let attempts_so_far = prior.saturating_add(
+                            if is_auto_continue_process(&ctx.execution_process) {
+                                1
+                            } else {
+                                0
+                            },
+                        );
+                        if under_retry_cap(attempts_so_far) {
+                            tracing::info!(
+                                "Auto-continuing session {} after transient Claude API stall (attempt {} of {})",
+                                ctx.session.id,
+                                attempts_so_far + 1,
+                                MAX_AUTO_CONTINUE_RETRIES
+                            );
+                            tokio::time::sleep(AUTO_CONTINUE_BACKOFF).await;
+
+                            // Re-check after the backoff: a user may have started or
+                            // queued a follow-up during the sleep. Don't spawn a
+                            // competing run in that case.
+                            let superseded =
+                                container.queued_message_service.has_queued(ctx.session.id)
+                                    || ExecutionProcess::has_running_coding_agent_for_session(
+                                        &db.pool,
+                                        ctx.session.id,
+                                    )
+                                    .await
+                                    .unwrap_or(true);
+                            if superseded {
+                                tracing::info!(
+                                    "Skipping auto-continue for session {}: superseded by a user follow-up during backoff",
+                                    ctx.session.id
+                                );
+                            } else {
+                                match container.start_auto_continue(&ctx).await {
+                                    Ok(_) => {
+                                        already_finalized = true; // a new run is now in flight; do not finalize
+                                    }
+                                    Err(e) => {
+                                        tracing::error!(
+                                            "Failed to start auto-continue for session {}: {e}",
+                                            ctx.session.id
+                                        );
+                                        // fall through to normal finalize
+                                    }
+                                }
+                            }
+                        } else {
+                            tracing::warn!(
+                                "Session {} hit auto-continue cap ({}); finalizing as failed",
+                                ctx.session.id,
+                                MAX_AUTO_CONTINUE_RETRIES
+                            );
+                        }
+                    }
+
                     if !already_finalized && container.should_finalize(&ctx) {
                         let has_chained_follow_up = ctx
                             .execution_process
@@ -656,12 +759,15 @@ impl LocalContainerService {
                             .is_some();
                         let mut started_queued_follow_up = false;
 
-                        // Only execute queued messages if the execution succeeded
-                        // If it failed or was killed, just clear the queue and finalize
+                        // Only execute queued messages if the execution succeeded.
+                        // If it failed or was killed, just clear the queue and finalize —
+                        // EXCEPT a retryable API stall, which is a transient interruption
+                        // rather than a real failure, so the user's queued message should
+                        // still run (resuming the session) instead of being discarded.
                         let should_execute_queued = !matches!(
                             ctx.execution_process.status,
                             ExecutionProcessStatus::Failed | ExecutionProcessStatus::Killed
-                        );
+                        ) || ended_in_retryable_stall;
 
                         if let Some(queued_msg) =
                             container.queued_message_service.take_queued(ctx.session.id)
@@ -994,6 +1100,48 @@ impl LocalContainerService {
         None
     }
 
+    /// Does the MsgStore history for this execution end in a retryable API stall?
+    fn last_turn_ended_in_retryable_stall(&self, exec_id: &Uuid) -> bool {
+        let Some(msg_stores) = self.msg_stores.try_read().ok() else {
+            return false;
+        };
+        let Some(msg_store) = msg_stores.get(exec_id) else {
+            return false;
+        };
+        history_has_retryable_stall(&msg_store.get_history())
+    }
+
+    /// How many of the most-recent *consecutive* coding-agent processes for this
+    /// session (excluding `before_exec_id`) were auto-continue follow-ups. Used to
+    /// cap auto-continue depth. Stateless / restart-safe: reads the persisted
+    /// `executor_action` column.
+    async fn consecutive_auto_continue_count(&self, session_id: Uuid, before_exec_id: Uuid) -> u32 {
+        let procs =
+            match ExecutionProcess::find_by_session_id(&self.db.pool, session_id, false).await {
+                Ok(p) => p,
+                Err(e) => {
+                    tracing::warn!("consecutive_auto_continue_count query failed: {e}");
+                    return u32::MAX; // fail closed: treat as "at cap", do not retry
+                }
+            };
+        let mut count = 0;
+        // find_by_session_id returns ASC by created_at; walk newest-first.
+        for p in procs.iter().rev() {
+            if p.id == before_exec_id {
+                continue;
+            }
+            if p.run_reason != ExecutionProcessRunReason::CodingAgent {
+                break;
+            }
+            if is_auto_continue_process(p) {
+                count += 1;
+            } else {
+                break;
+            }
+        }
+        count
+    }
+
     /// Update the coding agent turn summary with the final assistant message
     async fn update_executor_session_summary(&self, exec_id: &Uuid) -> Result<(), anyhow::Error> {
         // Check if there's a coding agent turn for this execution process
@@ -1294,6 +1442,66 @@ impl LocalContainerService {
             &ctx.workspace,
             &ctx.session,
             &action,
+            &ExecutionProcessRunReason::CodingAgent,
+        )
+        .await
+    }
+
+    /// Resume a session after a transient Claude API stall by replaying the
+    /// interrupted run's own executor config with the fixed continue prompt.
+    async fn start_auto_continue(
+        &self,
+        ctx: &ExecutionContext,
+    ) -> Result<ExecutionProcess, ContainerError> {
+        // AUTO_CONTINUE_PROMPT is the shared module-level const defined in Task 5 —
+        // the counter reads it to identify prior auto-continues, so both must use
+        // the exact same string. Do NOT redefine it locally.
+
+        let latest_session_info =
+            CodingAgentTurn::find_latest_session_info(&self.db.pool, ctx.session.id).await?;
+        let Some(info) = latest_session_info else {
+            return Err(ContainerError::Other(anyhow!(
+                "cannot auto-continue: no prior session info for session {}",
+                ctx.session.id
+            )));
+        };
+
+        // Reuse the interrupted run's own executor config (same profile/model).
+        let action = ctx.execution_process.executor_action()?;
+        let executor_config = match action.typ() {
+            ExecutorActionType::CodingAgentFollowUpRequest(r) => r.executor_config.clone(),
+            ExecutorActionType::CodingAgentInitialRequest(r) => r.executor_config.clone(),
+            _ => {
+                return Err(ContainerError::Other(anyhow!(
+                    "cannot auto-continue: last action is not a coding-agent request"
+                )));
+            }
+        };
+
+        let repos =
+            WorkspaceRepo::find_repos_for_workspace(&self.db.pool, ctx.workspace.id).await?;
+        let cleanup_action = self.cleanup_actions_for_repos(&repos);
+        let working_dir = ctx
+            .session
+            .agent_working_dir
+            .as_ref()
+            .filter(|dir| !dir.is_empty())
+            .cloned();
+
+        let action_type =
+            ExecutorActionType::CodingAgentFollowUpRequest(CodingAgentFollowUpRequest {
+                prompt: AUTO_CONTINUE_PROMPT.to_string(),
+                session_id: info.session_id,
+                reset_to_message_id: None,
+                executor_config,
+                working_dir,
+            });
+        let new_action = ExecutorAction::new(action_type, cleanup_action.map(Box::new));
+
+        self.start_execution(
+            &ctx.workspace,
+            &ctx.session,
+            &new_action,
             &ExecutionProcessRunReason::CodingAgent,
         )
         .await
@@ -1842,5 +2050,111 @@ fn success_exit_status() -> std::process::ExitStatus {
     {
         use std::os::windows::process::ExitStatusExt;
         ExitStatusExt::from_raw(0)
+    }
+}
+
+/// Prompt sent when auto-continuing a Claude turn interrupted by a transient
+/// API stall. Also the durable marker used to count consecutive auto-continues.
+pub(crate) const AUTO_CONTINUE_PROMPT: &str = "Please continue from where you were interrupted.";
+
+/// True if this process is an auto-continue follow-up (its executor action is a
+/// coding-agent follow-up carrying the `AUTO_CONTINUE_PROMPT` sentinel).
+fn is_auto_continue_process(proc: &ExecutionProcess) -> bool {
+    proc.executor_action()
+        .ok()
+        .map(|action| {
+            matches!(
+                action.typ(),
+                ExecutorActionType::CodingAgentFollowUpRequest(req)
+                    if req.prompt == AUTO_CONTINUE_PROMPT
+            )
+        })
+        .unwrap_or(false)
+}
+
+/// True if the most recent error entry in the history is a retryable API error.
+/// Scans newest-first; the first `ErrorMessage` entry encountered decides the
+/// terminal outcome (a later fatal error correctly overrides an earlier stall).
+fn history_has_retryable_stall(history: &[LogMsg]) -> bool {
+    for msg in history.iter().rev() {
+        if let LogMsg::JsonPatch(patch) = msg
+            && let Some((_, entry)) = extract_normalized_entry_from_patch(patch)
+            && let NormalizedEntryType::ErrorMessage { error_type } = &entry.entry_type
+        {
+            return matches!(error_type, NormalizedEntryError::RetryableApiError);
+        }
+    }
+    false
+}
+
+#[cfg(test)]
+mod retryable_stall_tests {
+    use super::*;
+
+    #[test]
+    fn detects_retryable_stall_in_history() {
+        use executors::logs::{
+            NormalizedEntry, NormalizedEntryError, NormalizedEntryType, utils::ConversationPatch,
+        };
+        let entry = NormalizedEntry {
+            timestamp: None,
+            entry_type: NormalizedEntryType::ErrorMessage {
+                error_type: NormalizedEntryError::RetryableApiError,
+            },
+            content: "API Error: Response stalled mid-stream.".to_string(),
+            metadata: None,
+        };
+        let patch = ConversationPatch::add_normalized_entry(0, entry);
+        let history = vec![LogMsg::JsonPatch(patch)];
+        assert!(history_has_retryable_stall(&history));
+    }
+
+    #[test]
+    fn no_retryable_stall_in_empty_history() {
+        assert!(!history_has_retryable_stall(&[]));
+    }
+
+    #[test]
+    fn later_fatal_error_overrides_earlier_retryable_stall() {
+        use executors::logs::{
+            NormalizedEntry, NormalizedEntryError, NormalizedEntryType, utils::ConversationPatch,
+        };
+        // older: retryable stall; newer: fatal error -> most recent decides -> false
+        let retryable = NormalizedEntry {
+            timestamp: None,
+            entry_type: NormalizedEntryType::ErrorMessage {
+                error_type: NormalizedEntryError::RetryableApiError,
+            },
+            content: "API Error: Response stalled mid-stream.".to_string(),
+            metadata: None,
+        };
+        let fatal = NormalizedEntry {
+            timestamp: None,
+            entry_type: NormalizedEntryType::ErrorMessage {
+                error_type: NormalizedEntryError::Other,
+            },
+            content: "API Error: fatal, non-retryable.".to_string(),
+            metadata: None,
+        };
+        let history = vec![
+            LogMsg::JsonPatch(ConversationPatch::add_normalized_entry(0, retryable)),
+            LogMsg::JsonPatch(ConversationPatch::add_normalized_entry(1, fatal)),
+        ];
+        assert!(!history_has_retryable_stall(&history));
+    }
+
+    #[test]
+    fn cap_allows_three_then_blocks_fourth() {
+        // `attempts_so_far` = auto-continues already spawned in this chain,
+        // including the just-failed one when it is itself an auto-continue.
+        // Original stall: 0 prior → allowed (spawns #1).
+        assert!(under_retry_cap(0));
+        // After #1 failed: 1 → allowed (spawns #2).
+        assert!(under_retry_cap(1));
+        // After #2 failed: 2 → allowed (spawns #3).
+        assert!(under_retry_cap(2));
+        // After #3 failed: 3 → BLOCKED (must NOT spawn a 4th).
+        assert!(!under_retry_cap(3));
+        assert!(!under_retry_cap(4));
     }
 }

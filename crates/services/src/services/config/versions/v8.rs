@@ -29,6 +29,10 @@ fn default_relay_enabled() -> bool {
     true
 }
 
+fn default_auto_continue_on_api_stall_enabled() -> bool {
+    true
+}
+
 #[derive(Clone, Debug, Default, Serialize, Deserialize, TS, PartialEq, Eq)]
 pub enum SendMessageShortcut {
     #[default]
@@ -76,6 +80,8 @@ pub struct Config {
     pub relay_enabled: bool,
     #[serde(default)]
     pub host_nickname: Option<String>,
+    #[serde(default = "default_auto_continue_on_api_stall_enabled")]
+    pub auto_continue_on_api_stall_enabled: bool,
 }
 
 impl Config {
@@ -109,6 +115,7 @@ impl Config {
             send_message_shortcut: SendMessageShortcut::default(),
             relay_enabled: true,
             host_nickname: None,
+            auto_continue_on_api_stall_enabled: true,
         }
     }
 
@@ -167,6 +174,7 @@ impl Default for Config {
             send_message_shortcut: SendMessageShortcut::default(),
             relay_enabled: true,
             host_nickname: None,
+            auto_continue_on_api_stall_enabled: true,
         }
     }
 }
