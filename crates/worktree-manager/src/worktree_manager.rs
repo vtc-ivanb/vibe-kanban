@@ -9,7 +9,7 @@ static WORKSPACE_DIR_OVERRIDE: OnceLock<PathBuf> = OnceLock::new();
 
 use git::{GitService, GitServiceError};
 use thiserror::Error;
-use tracing::{debug, info, trace};
+use tracing::{debug, info, trace, warn};
 use utils::{path::normalize_macos_private_alias, shell::resolve_executable_path};
 
 // Global synchronization for worktree creation to prevent race conditions
@@ -47,6 +47,37 @@ pub enum WorktreeError {
     BranchNotFound(String),
     #[error("Repository error: {0}")]
     Repository(String),
+}
+
+/// Whether `path` is a directory we can enumerate and that holds nothing.
+///
+/// A directory we cannot even read counts as non-empty: we have no evidence it is
+/// safe to check out into, so callers should keep treating removal failure as fatal.
+fn dir_is_empty(path: &Path) -> bool {
+    fs::read_dir(path).is_ok_and(|mut entries| entries.next().is_none())
+}
+
+/// Remove a worktree directory, tolerating a lock we cannot break on an empty one.
+///
+/// `git worktree add` happily checks out into an existing *empty* directory, so a
+/// directory we failed to remove only blocks recreation while it still has contents.
+/// This matters on Windows, where a process whose current working directory is the
+/// worktree (a leftover terminal shell, say) pins the path indefinitely: treating
+/// that as fatal wedges the workspace permanently, and every follow-up on it fails
+/// with `ERROR_SHARING_VIOLATION` instead of just re-checking-out the branch.
+fn remove_worktree_dir(worktree_path: &Path) -> Result<(), WorktreeError> {
+    match utils::fs::remove_dir_all_safe(worktree_path) {
+        Ok(()) => Ok(()),
+        Err(e) if dir_is_empty(worktree_path) => {
+            warn!(
+                "Could not remove empty worktree directory {} ({}); reusing it in place",
+                worktree_path.display(),
+                e
+            );
+            Ok(())
+        }
+        Err(e) => Err(WorktreeError::Io(e)),
+    }
 }
 
 pub struct WorktreeManager;
@@ -255,7 +286,7 @@ impl WorktreeManager {
             // Use the all-or-nothing remover: on Windows this relocates the directory
             // atomically rather than deleting in place, so an open handle (e.g. a file
             // watcher) can never leave a half-deleted, corrupted worktree behind.
-            utils::fs::remove_dir_all_safe(worktree_path).map_err(WorktreeError::Io)?;
+            remove_worktree_dir(worktree_path)?;
         }
 
         // Step 4: Good-practice to clean up any other stale admin entries
@@ -340,8 +371,7 @@ impl WorktreeManager {
                     // Clean up physical directory if it exists
                     // Needed if previous attempt failed after directory creation
                     if worktree_path.exists() {
-                        utils::fs::remove_dir_all_safe(&worktree_path)
-                            .map_err(WorktreeError::Io)?;
+                        remove_worktree_dir(&worktree_path)?;
                     }
                     if let Err(e2) = git_service.add_worktree(
                         &git_repo_path,
@@ -584,4 +614,91 @@ async fn create_worktree_when_repo_path_is_a_worktree() {
     )
     .await
     .unwrap();
+}
+
+#[cfg(test)]
+mod remove_worktree_dir_tests {
+    use super::*;
+
+    #[test]
+    fn removes_a_populated_worktree() {
+        let tmp = tempfile::tempdir().unwrap();
+        let worktree = tmp.path().join("worktree");
+        fs::create_dir_all(worktree.join("nested")).unwrap();
+        fs::write(worktree.join("nested").join("file.txt"), b"hi").unwrap();
+
+        remove_worktree_dir(&worktree).unwrap();
+
+        assert!(!worktree.exists());
+    }
+
+    #[test]
+    fn dir_is_empty_reports_contents() {
+        let tmp = tempfile::tempdir().unwrap();
+        let dir = tmp.path().join("dir");
+        fs::create_dir(&dir).unwrap();
+        assert!(dir_is_empty(&dir));
+
+        fs::write(dir.join("file.txt"), b"hi").unwrap();
+        assert!(!dir_is_empty(&dir));
+    }
+
+    /// A shell whose current working directory is the worktree pins the path: the
+    /// rename inside `remove_dir_all_safe` fails with ERROR_SHARING_VIOLATION. An
+    /// empty directory is still perfectly usable as a `git worktree add` target, so
+    /// that must not abort recreation.
+    #[cfg(windows)]
+    #[test]
+    fn tolerates_an_empty_worktree_we_cannot_remove() {
+        use std::os::windows::fs::OpenOptionsExt;
+
+        // Required to open a *directory* handle.
+        const FILE_FLAG_BACKUP_SEMANTICS: u32 = 0x0200_0000;
+        // Exactly how Windows holds a process's current working directory: readable
+        // and writable by others, but not renameable or deletable.
+        const FILE_SHARE_READ_WRITE: u32 = 0x0000_0001 | 0x0000_0002;
+
+        let tmp = tempfile::tempdir().unwrap();
+        let worktree = tmp.path().join("worktree");
+        fs::create_dir(&worktree).unwrap();
+
+        let handle = fs::OpenOptions::new()
+            .read(true)
+            .share_mode(FILE_SHARE_READ_WRITE)
+            .custom_flags(FILE_FLAG_BACKUP_SEMANTICS)
+            .open(&worktree)
+            .unwrap();
+
+        // Precondition: without the tolerance this is the error that wedged the workspace.
+        assert!(utils::fs::remove_dir_all_safe(&worktree).is_err());
+
+        remove_worktree_dir(&worktree).expect("an empty locked worktree must stay usable");
+        assert!(worktree.exists(), "the directory is reused in place");
+
+        drop(handle);
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn still_fails_on_a_populated_worktree_we_cannot_remove() {
+        use std::{io::Write, os::windows::fs::OpenOptionsExt};
+
+        let tmp = tempfile::tempdir().unwrap();
+        let worktree = tmp.path().join("worktree");
+        fs::create_dir(&worktree).unwrap();
+
+        let mut locked = fs::OpenOptions::new()
+            .create(true)
+            .truncate(true)
+            .write(true)
+            .share_mode(0)
+            .open(worktree.join("locked.txt"))
+            .unwrap();
+        locked.write_all(b"x").unwrap();
+
+        // Contents survive, so reusing the directory would corrupt the checkout.
+        assert!(remove_worktree_dir(&worktree).is_err());
+
+        drop(locked);
+    }
 }

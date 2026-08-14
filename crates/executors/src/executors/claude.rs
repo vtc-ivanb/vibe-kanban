@@ -1820,8 +1820,7 @@ impl ClaudeLogProcessor {
                 // previous session was torn down while a background task was still outstanding
                 // (see keep-alive handling in claude/protocol.rs).
                 let empty_bg_continuation = *num_turns == Some(0)
-                    && origin.as_ref().and_then(|o| o.kind.as_deref())
-                        == Some("task-notification");
+                    && origin.as_ref().and_then(|o| o.kind.as_deref()) == Some("task-notification");
 
                 if empty_bg_continuation {
                     // nothing to surface
@@ -2808,6 +2807,26 @@ mod tests {
         normalize_helper(&mut processor, json, worktree)
     }
 
+    /// Build an absolute path for the current platform.
+    ///
+    /// A POSIX literal like `/tmp/x` has a root but no prefix on Windows, so
+    /// `make_path_relative` sees a *relative* path and returns it untouched — the
+    /// worktree-relative rendering under test never runs.
+    fn abs(segments: &[&str]) -> String {
+        let mut path = std::path::PathBuf::from(if cfg!(windows) { r"C:\" } else { "/" });
+        path.extend(segments);
+        path.to_string_lossy().into_owned()
+    }
+
+    /// Build a relative path using the current platform's separator.
+    fn rel(segments: &[&str]) -> String {
+        segments
+            .iter()
+            .collect::<std::path::PathBuf>()
+            .to_string_lossy()
+            .into_owned()
+    }
+
     #[test]
     fn test_claude_json_parsing() {
         let system_json =
@@ -2965,31 +2984,30 @@ mod tests {
     #[test]
     fn test_ls_tool_content_extraction() {
         // Test LS with path
+        let worktree = abs(&["tmp", "test-worktree"]);
         let ls_data = ClaudeToolData::LS {
-            path: "/tmp/test-worktree/components".to_string(),
+            path: abs(&["tmp", "test-worktree", "components"]),
         };
 
-        let action_type = ClaudeLogProcessor::extract_action_type(&ls_data, "/tmp/test-worktree");
-        let result = ClaudeLogProcessor::generate_concise_content(
-            &ls_data,
-            &action_type,
-            "/tmp/test-worktree",
-        );
+        let action_type = ClaudeLogProcessor::extract_action_type(&ls_data, &worktree);
+        let result =
+            ClaudeLogProcessor::generate_concise_content(&ls_data, &action_type, &worktree);
 
         assert_eq!(result, "List directory: components");
     }
 
     #[test]
     fn test_path_relative_conversion() {
+        let worktree = abs(&["tmp", "test-worktree"]);
+
         // Test with relative path (should remain unchanged)
-        let relative_result = make_path_relative("src/main.rs", "/tmp/test-worktree");
+        let relative_result = make_path_relative("src/main.rs", &worktree);
         assert_eq!(relative_result, "src/main.rs");
 
         // Test with absolute path (should become relative if possible)
-        let test_worktree = "/tmp/test-worktree";
-        let absolute_path = format!("{test_worktree}/src/main.rs");
-        let absolute_result = make_path_relative(&absolute_path, test_worktree);
-        assert_eq!(absolute_result, "src/main.rs");
+        let absolute_path = abs(&["tmp", "test-worktree", "src", "main.rs"]);
+        let absolute_result = make_path_relative(&absolute_path, &worktree);
+        assert_eq!(absolute_result, rel(&["src", "main.rs"]));
     }
 
     #[tokio::test]
@@ -3062,39 +3080,43 @@ mod tests {
 
     #[test]
     fn test_amp_tool_aliases_create_file_and_edit_file() {
+        let worktree = abs(&["work"]);
+
         // Amp "create_file" should deserialize into Write with alias field "path"
-        let assistant_with_create = r#"{
-            "type":"assistant",
-            "message":{
-                "role":"assistant",
-                "content":[
-                    {"type":"tool_use","id":"t1","name":"create_file","input":{"path":"/tmp/work/src/new.txt","content":"hello"}}
+        let assistant_with_create = serde_json::json!({
+            "type": "assistant",
+            "message": {
+                "role": "assistant",
+                "content": [
+                    {"type":"tool_use","id":"t1","name":"create_file","input":{"path": abs(&["work", "src", "new.txt"]), "content":"hello"}}
                 ]
             }
-        }"#;
-        let parsed: ClaudeJson = serde_json::from_str(assistant_with_create).unwrap();
-        let entries = normalize(&parsed, "/tmp/work");
+        });
+        let parsed: ClaudeJson = serde_json::from_value(assistant_with_create).unwrap();
+        let entries = normalize(&parsed, &worktree);
         assert_eq!(entries.len(), 1);
         match &entries[0].entry_type {
             NormalizedEntryType::ToolUse { action_type, .. } => match action_type {
-                ActionType::FileEdit { path, .. } => assert_eq!(path, "src/new.txt"),
+                ActionType::FileEdit { path, .. } => {
+                    assert_eq!(path, &rel(&["src", "new.txt"]))
+                }
                 other => panic!("Expected FileEdit, got {other:?}"),
             },
             other => panic!("Expected ToolUse, got {other:?}"),
         }
 
         // Amp "edit_file" should deserialize into Edit with aliases for path/old_str/new_str
-        let assistant_with_edit = r#"{
-            "type":"assistant",
-            "message":{
-                "role":"assistant",
-                "content":[
-                    {"type":"tool_use","id":"t2","name":"edit_file","input":{"path":"/tmp/work/README.md","old_str":"foo","new_str":"bar"}}
+        let assistant_with_edit = serde_json::json!({
+            "type": "assistant",
+            "message": {
+                "role": "assistant",
+                "content": [
+                    {"type":"tool_use","id":"t2","name":"edit_file","input":{"path": abs(&["work", "README.md"]), "old_str":"foo","new_str":"bar"}}
                 ]
             }
-        }"#;
-        let parsed_edit: ClaudeJson = serde_json::from_str(assistant_with_edit).unwrap();
-        let entries = normalize(&parsed_edit, "/tmp/work");
+        });
+        let parsed_edit: ClaudeJson = serde_json::from_value(assistant_with_edit).unwrap();
+        let entries = normalize(&parsed_edit, &worktree);
         assert_eq!(entries.len(), 1);
         match &entries[0].entry_type {
             NormalizedEntryType::ToolUse { action_type, .. } => match action_type {

@@ -221,6 +221,9 @@ impl Deployment for LocalDeployment {
             analytics_service: s.clone(),
         });
         let workspace_manager = WorkspaceManager::new(db.clone());
+        // Constructed before the container so it can close a workspace's terminals
+        // before deleting or recreating its worktrees.
+        let pty = PtyService::new();
         let container = LocalContainerService::new(
             db.clone(),
             workspace_manager.clone(),
@@ -232,6 +235,7 @@ impl Deployment for LocalDeployment {
             approvals.clone(),
             queued_message_service.clone(),
             remote_client.clone().ok(),
+            pty.clone(),
         )
         .await;
 
@@ -239,7 +243,6 @@ impl Deployment for LocalDeployment {
 
         let file_search_cache = Arc::new(FileSearchCache::new());
 
-        let pty = PtyService::new();
         let relay_hosts = match remote_client.clone().ok() {
             Some(remote_client) => Some(Arc::new(
                 RelayHosts::load(

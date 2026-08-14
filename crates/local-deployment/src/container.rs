@@ -62,7 +62,7 @@ use utils::{
 use uuid::Uuid;
 use workspace_manager::{RepoWorkspaceInput, WorkspaceError, WorkspaceManager};
 
-use crate::{command, copy};
+use crate::{command, copy, pty::PtyService};
 
 const WORKSPACE_TOUCH_DEBOUNCE: Duration = Duration::from_mins(2);
 
@@ -87,6 +87,7 @@ pub struct LocalContainerService {
     notification_service: NotificationService,
     remote_client: Option<RemoteClient>,
     merge_intents: Arc<RwLock<HashMap<Uuid, services::services::merge_commit::PendingMerge>>>,
+    pty: PtyService,
 }
 
 impl LocalContainerService {
@@ -102,6 +103,7 @@ impl LocalContainerService {
         approvals: Approvals,
         queued_message_service: QueuedMessageService,
         remote_client: Option<RemoteClient>,
+        pty: PtyService,
     ) -> Self {
         let child_store = Arc::new(RwLock::new(HashMap::new()));
         let cancellation_tokens = Arc::new(RwLock::new(HashMap::new()));
@@ -128,6 +130,7 @@ impl LocalContainerService {
             notification_service,
             remote_client,
             merge_intents: Arc::new(RwLock::new(HashMap::new())),
+            pty,
         };
 
         container.spawn_workspace_cleanup();
@@ -241,11 +244,29 @@ impl LocalContainerService {
         map.remove(id)
     }
 
+    /// Kill any terminal shells running inside `workspace_dir`.
+    ///
+    /// Their working directory is about to be deleted or replaced, and a live shell
+    /// there keeps the directory open — on Windows that blocks removal outright.
+    async fn close_workspace_terminals(&self, workspace_id: Uuid, workspace_dir: &Path) {
+        let closed = self.pty.close_sessions_under(workspace_dir).await;
+        if closed > 0 {
+            tracing::info!(
+                "Closed {} terminal session(s) in workspace {} before touching its worktrees",
+                closed,
+                workspace_id
+            );
+        }
+    }
+
     async fn cleanup_workspace(&self, workspace: &Workspace) {
         let Some(container_ref) = &workspace.container_ref else {
             return;
         };
         let workspace_dir = PathBuf::from(container_ref);
+
+        self.close_workspace_terminals(workspace.id, &workspace_dir)
+            .await;
 
         let repositories = WorkspaceRepo::find_repos_for_workspace(&self.db.pool, workspace.id)
             .await
@@ -1427,6 +1448,13 @@ impl ContainerService for LocalContainerService {
                 LocalContainerService::dir_name_from_workspace(&workspace.id, label);
             WorkspaceManager::get_workspace_base_dir().join(&workspace_dir_name)
         };
+
+        if workspace.worktree_deleted {
+            // The worktrees are gone, so any shell still sitting in one is stale and
+            // only serves to pin the directory against recreation.
+            self.close_workspace_terminals(workspace.id, &workspace_dir)
+                .await;
+        }
 
         WorkspaceManager::ensure_workspace_exists(
             &workspace_dir,

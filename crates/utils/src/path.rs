@@ -133,25 +133,43 @@ pub fn expand_tilde(path_str: &str) -> std::path::PathBuf {
 mod tests {
     use super::*;
 
+    /// Build an absolute path for the current platform.
+    ///
+    /// A POSIX literal like `/tmp/x` has a root but no prefix on Windows, so
+    /// `Path::is_absolute` reports false and [`make_path_relative`] returns early
+    /// without ever exercising the prefix stripping these tests are about.
+    fn abs(segments: &[&str]) -> String {
+        let mut path = PathBuf::from(if cfg!(windows) { r"C:\" } else { "/" });
+        path.extend(segments);
+        path.to_string_lossy().into_owned()
+    }
+
+    /// Build a relative path using the current platform's separator.
+    fn rel(segments: &[&str]) -> String {
+        segments
+            .iter()
+            .collect::<PathBuf>()
+            .to_string_lossy()
+            .into_owned()
+    }
+
     #[test]
     fn test_make_path_relative() {
+        let worktree = abs(&["tmp", "test-worktree"]);
+
         // Test with relative path (should remain unchanged)
-        assert_eq!(
-            make_path_relative("src/main.rs", "/tmp/test-worktree"),
-            "src/main.rs"
-        );
+        assert_eq!(make_path_relative("src/main.rs", &worktree), "src/main.rs");
 
         // Test with absolute path (should become relative if possible)
-        let test_worktree = "/tmp/test-worktree";
-        let absolute_path = format!("{test_worktree}/src/main.rs");
-        let result = make_path_relative(&absolute_path, test_worktree);
-        assert_eq!(result, "src/main.rs");
+        let absolute_path = abs(&["tmp", "test-worktree", "src", "main.rs"]);
+        assert_eq!(
+            make_path_relative(&absolute_path, &worktree),
+            rel(&["src", "main.rs"])
+        );
 
         // Test with path outside worktree (should return original)
-        assert_eq!(
-            make_path_relative("/other/path/file.js", "/tmp/test-worktree"),
-            "/other/path/file.js"
-        );
+        let outside = abs(&["other", "path", "file.js"]);
+        assert_eq!(make_path_relative(&outside, &worktree), outside);
     }
 
     #[cfg(target_os = "macos")]

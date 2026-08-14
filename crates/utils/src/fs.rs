@@ -26,6 +26,12 @@ pub const TRASH_PREFIX: &str = ".vk-trash-";
 ///   - failure: the directory is left **fully intact** and the error is returned. We
 ///     deliberately do not fall back to a destructive partial `remove_dir_all`.
 ///
+/// The rename is retried briefly on sharing violations, because a handle that is
+/// already on its way out clears in tens of milliseconds — the console host that
+/// ConPTY spawns alongside a shell outlives that shell by about that long, so a
+/// single attempt right after killing a terminal loses the race. Each attempt is
+/// still one atomic rename, so the all-or-nothing guarantee is unaffected.
+///
 /// A non-existent path is treated as success.
 pub fn remove_dir_all_safe(path: &Path) -> io::Result<()> {
     if !path.exists() {
@@ -39,15 +45,29 @@ pub fn remove_dir_all_safe(path: &Path) -> io::Result<()> {
 
     #[cfg(windows)]
     {
+        use std::time::Duration;
+
         let trash = unique_trash_path(path)?;
+        let mut delay = Duration::from_millis(20);
+        let mut last_err = None;
+
         // Rename is atomic: it either frees `path` entirely or fails leaving it intact.
-        match std::fs::rename(path, &trash) {
-            Ok(()) => {
-                spawn_background_delete(trash);
-                Ok(())
+        for _ in 0..6 {
+            match std::fs::rename(path, &trash) {
+                Ok(()) => {
+                    spawn_background_delete(trash);
+                    return Ok(());
+                }
+                Err(e) if is_sharing_violation(&e) => {
+                    last_err = Some(e);
+                    std::thread::sleep(delay);
+                    delay = (delay * 2).min(Duration::from_millis(500));
+                }
+                Err(e) => return Err(e),
             }
-            Err(e) => Err(e),
         }
+
+        Err(last_err.unwrap_or_else(|| io::Error::other("remove_dir_all_safe: retries exhausted")))
     }
 }
 
@@ -199,6 +219,43 @@ mod tests {
         std::fs::create_dir_all(&keep).unwrap();
         sweep_trash(dir.path());
         assert!(keep.exists());
+    }
+
+    /// A killed terminal's console host keeps the directory for a few more
+    /// milliseconds. The removal has to ride that out rather than fail.
+    #[cfg(windows)]
+    #[test]
+    fn remove_dir_all_safe_retries_through_a_transient_lock() {
+        use std::{os::windows::fs::OpenOptionsExt, time::Duration};
+
+        // Required to open a *directory* handle; the share flags match how Windows
+        // holds a working directory — renameable by nobody, readable by anyone.
+        const FILE_FLAG_BACKUP_SEMANTICS: u32 = 0x0200_0000;
+        const FILE_SHARE_READ_WRITE: u32 = 0x0000_0001 | 0x0000_0002;
+
+        let dir = tempfile::tempdir().unwrap();
+        let target = dir.path().join("worktree");
+        std::fs::create_dir(&target).unwrap();
+        std::fs::write(target.join("file.txt"), b"hi").unwrap();
+
+        let handle = std::fs::OpenOptions::new()
+            .read(true)
+            .share_mode(FILE_SHARE_READ_WRITE)
+            .custom_flags(FILE_FLAG_BACKUP_SEMANTICS)
+            .open(&target)
+            .unwrap();
+        assert!(
+            std::fs::rename(&target, dir.path().join("probe")).is_err(),
+            "precondition: the handle must block the rename"
+        );
+
+        std::thread::spawn(move || {
+            std::thread::sleep(Duration::from_millis(60));
+            drop(handle);
+        });
+
+        remove_dir_all_safe(&target).expect("a lock that clears must not fail the removal");
+        assert!(!target.exists());
     }
 
     #[cfg(windows)]
