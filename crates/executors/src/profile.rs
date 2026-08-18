@@ -556,3 +556,22 @@ impl ExecutorConfigs {
         Ok(ExecutorProfileId::new(selected))
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn default_profiles_ship_a_grok_agent_that_skips_approvals() {
+        let profiles = ExecutorConfigs::from_defaults();
+
+        let agent = profiles
+            .get_coding_agent(&ExecutorProfileId::new(BaseCodingAgent::Grok))
+            .expect("GROK should have a DEFAULT configuration");
+
+        match agent {
+            CodingAgent::Grok(grok) => assert_eq!(grok.always_approve, Some(true)),
+            other => panic!("expected a Grok agent, got {other:?}"),
+        }
+    }
+}

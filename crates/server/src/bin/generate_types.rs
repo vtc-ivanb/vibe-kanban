@@ -227,6 +227,7 @@ fn generate_types_content() -> String {
         executors::executors::copilot::Copilot::decl(),
         executors::executors::opencode::Opencode::decl(),
         executors::executors::qwen::QwenCode::decl(),
+        executors::executors::grok::Grok::decl(),
         executors::executors::droid::Droid::decl(),
         executors::executors::droid::Autonomy::decl(),
         executors::executors::droid::ReasoningEffortLevel::decl(),
@@ -354,6 +355,10 @@ fn generate_schemas() -> Result<HashMap<&'static str, String>, serde_json::Error
         (
             "droid",
             generate_json_schema::<executors::executors::droid::Droid>()?,
+        ),
+        (
+            "grok",
+            generate_json_schema::<executors::executors::grok::Grok>()?,
         ),
     ]);
     println!(

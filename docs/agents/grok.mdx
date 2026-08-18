@@ -1,0 +1,63 @@
+---
+title: "Grok"
+description: "Set up xAI Grok Build, the Grok coding agent CLI"
+icon: /images/grok-logo.svg
+---
+
+Vibe Kanban runs Grok Build as an [Agent Client Protocol](https://agentclientprotocol.com) agent, so tool calls and approvals appear inline alongside every other agent.
+
+<Steps>
+<Step title="Authenticate Grok">
+  Run the CLI once to sign in:
+
+  ```bash
+  npx -y @xai-official/grok login
+  ```
+
+  Your browser opens to complete the OAuth flow. On a machine without a browser, use a device code instead:
+
+  ```bash
+  npx -y @xai-official/grok login --device-code
+  ```
+
+  <Check>
+  Confirm you are signed in by listing the available models:
+
+  ```bash
+  npx -y @xai-official/grok models
+  ```
+  </Check>
+</Step>
+
+<Step title="Or authenticate with an API key">
+  Instead of signing in, set an xAI API key in the environment Vibe Kanban runs in:
+
+  ```bash
+  export XAI_API_KEY=your_api_key_here
+  ```
+
+  <Warning>
+  Signing in with a SuperGrok or X Premium+ subscription uses your subscription allowance. An API key bills per token instead.
+  </Warning>
+</Step>
+
+<Step title="Start Vibe Kanban">
+  ```bash
+  npx vibe-kanban
+  ```
+
+  You can now select Grok when creating task attempts. Choose between Grok 4.6 and Grok 4.5, and set a reasoning effort, in the agent configuration.
+</Step>
+</Steps>
+
+## Configuration
+
+Grok reads its settings from `~/.grok/config.toml`. MCP servers you enable for Grok in Vibe Kanban are written to the `mcp_servers` table in that file.
+
+<Note>
+If you set `GROK_HOME`, Grok keeps its config, credentials and sessions there instead. Vibe Kanban follows the same variable, so set it before launching Vibe Kanban rather than only in your shell profile.
+</Note>
+
+Vibe Kanban sets `GROK_DISABLE_AUTOUPDATER=1` for the sessions it spawns, so a task never waits on an update check. Set that variable yourself if you want different behaviour; your value takes precedence.
+
+For the full CLI reference, see the [official Grok Build documentation](https://docs.x.ai/build/overview).
