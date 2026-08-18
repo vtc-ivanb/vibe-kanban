@@ -50,6 +50,7 @@ use sqlx::Error as SqlxError;
 use thiserror::Error;
 use tokio::{sync::RwLock, task::JoinHandle};
 use utils::{
+    execution_logs::entry_timestamps_from_logs,
     log_msg::LogMsg,
     msg_store::MsgStore,
     text::{git_branch_id, short_uuid},
@@ -875,6 +876,10 @@ pub trait ContainerService {
             // Create temporary store and populate
             // Include JsonPatch messages (already normalized) and Stdout/Stderr (need normalization)
             let temp_store = Arc::new(MsgStore::new());
+            // Re-normalizing would otherwise stamp every entry with the current
+            // time. Hand back the times recorded during the original run first,
+            // so this must happen before any normalizer starts.
+            temp_store.set_entry_timestamps(entry_timestamps_from_logs(&raw_messages));
             for msg in raw_messages {
                 if matches!(
                     msg,
@@ -1294,16 +1299,8 @@ pub trait ContainerService {
             if let ContainerError::ExecutorError(ExecutorError::ExecutableNotFound { program }) =
                 &start_error
             {
-                let help_text = format!("The required executable `{program}` is not installed.");
-                let error_message = NormalizedEntry {
-                    timestamp: None,
-                    entry_type: NormalizedEntryType::ErrorMessage {
-                        error_type: NormalizedEntryError::SetupRequired,
-                    },
-                    content: help_text,
-                    metadata: None,
-                };
-                let patch = ConversationPatch::add_normalized_entry(2, error_message);
+                let patch =
+                    ConversationPatch::add_normalized_entry(2, setup_required_entry(program));
                 if let Err(e) = execution_process::append_log_message(
                     session.id,
                     execution_process.id,
@@ -1414,5 +1411,42 @@ pub trait ContainerService {
 
         tracing::debug!("Started next action: {:?}", next_action);
         Ok(())
+    }
+}
+
+/// The conversation entry shown when a coding agent's executable is missing.
+///
+/// This one is appended straight to the log file rather than pushed through
+/// `MsgStore`, so it must carry its own timestamp — the stamping seam in
+/// `MsgStore::push_patch` never sees it, and replay reproduces the stored
+/// patch verbatim.
+fn setup_required_entry(program: &str) -> NormalizedEntry {
+    NormalizedEntry {
+        timestamp: Some(chrono::Utc::now().to_rfc3339()),
+        entry_type: NormalizedEntryType::ErrorMessage {
+            error_type: NormalizedEntryError::SetupRequired,
+        },
+        content: format!("The required executable `{program}` is not installed."),
+        metadata: None,
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn setup_required_entry_carries_its_own_timestamp() {
+        let entry = setup_required_entry("claude");
+
+        assert!(
+            entry
+                .timestamp
+                .as_deref()
+                .and_then(|ts| chrono::DateTime::parse_from_rfc3339(ts).ok())
+                .is_some(),
+            "this entry is written straight to the log, so nothing downstream \
+             will stamp it and it must carry its own time"
+        );
     }
 }

@@ -33,6 +33,7 @@ import { useIsMobile } from '@/shared/hooks/useIsMobile';
 import {
   type MobileFontScale,
   useMobileFontScale,
+  useShowMessageTimestamps,
 } from '@/shared/stores/useUiPreferencesStore';
 import { cn, playSound } from '@/shared/lib/utils';
 import { PrimaryButton } from '@vibe/ui/components/PrimaryButton';
@@ -61,6 +62,8 @@ export function GeneralSettingsSection() {
 
   const isMobile = useIsMobile();
   const [mobileFontScale, setMobileFontScale] = useMobileFontScale();
+  const [showMessageTimestamps, setShowMessageTimestamps] =
+    useShowMessageTimestamps();
   const languageOptions = getLanguageOptions(
     t('language.browserDefault', {
       ns: 'common',
@@ -292,6 +295,16 @@ export function GeneralSettingsSection() {
             placeholder={t('settings.general.appearance.language.placeholder')}
           />
         </SettingsField>
+
+        <SettingsCheckbox
+          id="show-message-timestamps"
+          label={t('settings.general.appearance.messageTimestamps.label')}
+          description={t(
+            'settings.general.appearance.messageTimestamps.helper'
+          )}
+          checked={showMessageTimestamps}
+          onChange={setShowMessageTimestamps}
+        />
 
         {isMobile && (
           <SettingsField

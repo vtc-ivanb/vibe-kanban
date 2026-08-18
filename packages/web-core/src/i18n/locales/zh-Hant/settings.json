@@ -57,6 +57,10 @@
           "label": "語言",
           "placeholder": "選擇語言",
           "helper": "選擇您偏好的語言。瀏覽器預設將跟隨系統語言。"
+        },
+        "messageTimestamps": {
+          "label": "顯示訊息時間戳記",
+          "helper": "在對話中顯示每則訊息的撰寫時間。"
         }
       },
       "taskExecution": {

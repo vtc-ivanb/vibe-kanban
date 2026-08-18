@@ -21,6 +21,7 @@ import { getFileIcon } from '@/shared/lib/fileTypeIcon';
 import { useUserSystem } from '@/shared/hooks/useUserSystem';
 import { useTheme } from '@/shared/hooks/useTheme';
 import WYSIWYGEditor from '@/shared/components/WYSIWYGEditor';
+import { ConversationEntryTimestamp } from './ConversationEntryTimestamp';
 import { useMessageEditContext } from '../model/contexts/MessageEditContext';
 import type { UseResetProcessResult } from '../model/hooks/useResetProcess';
 import { useChangesViewActions } from '@/shared/hooks/useChangesView';
@@ -345,101 +346,130 @@ function DisplayConversationEntry(props: Props) {
 
   const entryType = entry.entry_type;
 
-  switch (entryType.type) {
-    case 'tool_use':
-      return renderToolUseEntry(entryType, entry, props, t);
+  const content = ((): React.ReactNode => {
+    switch (entryType.type) {
+      case 'tool_use':
+        return renderToolUseEntry(entryType, entry, props, t);
 
-    case 'user_message':
-      return (
-        <UserMessageEntry
-          content={entry.content}
-          expansionKey={expansionKey}
-          workspaceId={workspaceWithSession?.id}
-          sessionId={sessionId}
-          executionProcessId={executionProcessId}
-          executorCanFork={executorCanFork}
-          resetAction={resetAction}
-        />
-      );
+      case 'user_message':
+        return (
+          <UserMessageEntry
+            content={entry.content}
+            expansionKey={expansionKey}
+            workspaceId={workspaceWithSession?.id}
+            sessionId={sessionId}
+            executionProcessId={executionProcessId}
+            executorCanFork={executorCanFork}
+            resetAction={resetAction}
+          />
+        );
 
-    case 'assistant_message':
-      return (
-        <AssistantMessageEntry
-          content={entry.content}
-          workspaceId={workspaceWithSession?.id}
-          sessionId={sessionId}
-        />
-      );
+      case 'assistant_message':
+        return (
+          <AssistantMessageEntry
+            content={entry.content}
+            workspaceId={workspaceWithSession?.id}
+            sessionId={sessionId}
+          />
+        );
 
-    case 'system_message':
-      return (
-        <SystemMessageEntry
-          content={entry.content}
-          expansionKey={expansionKey}
-        />
-      );
+      case 'system_message':
+        return (
+          <SystemMessageEntry
+            content={entry.content}
+            expansionKey={expansionKey}
+          />
+        );
 
-    case 'thinking':
-      return (
-        <ChatThinkingMessage
-          content={entry.content}
-          workspaceId={workspaceWithSession?.id}
-          renderMarkdown={({ content, workspaceId, className }) => (
-            <AppChatMarkdown
-              content={content}
-              workspaceId={workspaceId}
-              sessionId={sessionId}
-              className={className}
-              maxWidth={undefined}
-            />
-          )}
-        />
-      );
+      case 'thinking':
+        return (
+          <ChatThinkingMessage
+            content={entry.content}
+            workspaceId={workspaceWithSession?.id}
+            renderMarkdown={({ content, workspaceId, className }) => (
+              <AppChatMarkdown
+                content={content}
+                workspaceId={workspaceId}
+                sessionId={sessionId}
+                className={className}
+                maxWidth={undefined}
+              />
+            )}
+          />
+        );
 
-    case 'error_message':
-      return (
-        <ErrorMessageEntry
-          content={entry.content}
-          expansionKey={expansionKey}
-        />
-      );
+      case 'error_message':
+        return (
+          <ErrorMessageEntry
+            content={entry.content}
+            expansionKey={expansionKey}
+          />
+        );
 
-    case 'next_action':
-      // The new design doesn't need the next action bar
-      return null;
+      case 'next_action':
+        // The new design doesn't need the next action bar
+        return null;
 
-    case 'token_usage_info':
-      // Displayed in the chat header as the context-usage gauge
-      return null;
+      case 'token_usage_info':
+        // Displayed in the chat header as the context-usage gauge
+        return null;
 
-    case 'user_feedback':
-      return (
-        <UserFeedbackEntry
-          content={entry.content}
-          deniedTool={entryType.denied_tool}
-          workspaceId={workspaceWithSession?.id}
-          sessionId={sessionId}
-        />
-      );
+      case 'user_feedback':
+        return (
+          <UserFeedbackEntry
+            content={entry.content}
+            deniedTool={entryType.denied_tool}
+            workspaceId={workspaceWithSession?.id}
+            sessionId={sessionId}
+          />
+        );
 
-    case 'user_answered_questions':
-      return (
-        <UserAnsweredQuestionsEntry
-          answers={entryType.answers}
-          expansionKey={expansionKey}
-        />
-      );
+      case 'user_answered_questions':
+        return (
+          <UserAnsweredQuestionsEntry
+            answers={entryType.answers}
+            expansionKey={expansionKey}
+          />
+        );
 
-    case 'loading':
-      return <LoadingEntry />;
+      case 'loading':
+        return <LoadingEntry />;
 
-    default: {
-      // Exhaustive check - TypeScript will error if a case is missing
-      const _exhaustiveCheck: never = entryType;
-      return _exhaustiveCheck;
+      default: {
+        // Exhaustive check - TypeScript will error if a case is missing
+        const _exhaustiveCheck: never = entryType;
+        return _exhaustiveCheck;
+      }
     }
+  })();
+
+  // Tool rows are noisy enough without a time on each, and entries that render
+  // nothing have nothing to stamp.
+  if (!MESSAGE_ENTRY_TYPES.has(entryType.type) || content === null) {
+    return content;
   }
+
+  return (
+    <div>
+      <ConversationEntryTimestamp timestamp={entry.timestamp} />
+      {content}
+    </div>
+  );
 }
+
+/**
+ * Entry types that represent a message someone would scan back through looking
+ * for "when did this happen?".
+ */
+const MESSAGE_ENTRY_TYPES = new Set<NormalizedEntry['entry_type']['type']>([
+  'user_message',
+  'assistant_message',
+  'thinking',
+  'system_message',
+  'error_message',
+  'user_feedback',
+  'user_answered_questions',
+]);
 
 /**
  * File edit entry with expandable diff

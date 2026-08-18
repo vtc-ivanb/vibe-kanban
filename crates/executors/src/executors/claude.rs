@@ -785,6 +785,7 @@ impl ClaudeLogProcessor {
                     | LogMsg::SessionId(_)
                     | LogMsg::MessageId(_)
                     | LogMsg::Stderr(_)
+                    | LogMsg::EntryTimestamp { .. }
                     | LogMsg::Ready => continue,
                     LogMsg::Finished => break,
                 };

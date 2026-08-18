@@ -1,5 +1,5 @@
 use std::{
-    collections::HashMap,
+    collections::{HashMap, HashSet},
     io::{IsTerminal, Write},
     sync::Arc,
 };
@@ -20,7 +20,7 @@ use utils::{
     assets::prod_asset_dir_path,
     execution_logs::{
         ExecutionLogWriter, process_log_file_path, process_log_file_path_in_root,
-        read_execution_log_file,
+        read_execution_log_file, stamped_entry_from_patch,
     },
     log_msg::LogMsg,
     msg_store::MsgStore,
@@ -280,9 +280,44 @@ pub fn spawn_stream_raw_logs_to_storage(
 
         if let Some(store) = store {
             let mut stream = store.history_plus_stream();
+            // Entry times are recorded once, when the entry first appears; later
+            // patches replacing the same entry must not move its clock.
+            let mut recorded_entry_times: HashSet<usize> = HashSet::new();
 
             while let Some(Ok(msg)) = stream.next().await {
                 match &msg {
+                    // Normalized entries are recomputed from raw output on every
+                    // read, so the only chance to record when an entry actually
+                    // happened is here, while the agent is running.
+                    LogMsg::JsonPatch(patch) => {
+                        let Some((index, ts)) = stamped_entry_from_patch(patch) else {
+                            continue;
+                        };
+                        if !recorded_entry_times.insert(index) {
+                            continue;
+                        }
+                        let record = LogMsg::EntryTimestamp { index, ts };
+                        match serde_json::to_string(&record) {
+                            Ok(line) => {
+                                if let Err(e) =
+                                    log_writer.append_jsonl_line(&format!("{line}\n")).await
+                                {
+                                    tracing::error!(
+                                        "Failed to append entry timestamp for execution {}: {}",
+                                        execution_id,
+                                        e
+                                    );
+                                }
+                            }
+                            Err(e) => {
+                                tracing::error!(
+                                    "Failed to serialize entry timestamp for execution {}: {}",
+                                    execution_id,
+                                    e
+                                );
+                            }
+                        }
+                    }
                     LogMsg::Stdout(_) | LogMsg::Stderr(_) => match serde_json::to_string(&msg) {
                         Ok(jsonl_line) => {
                             let mut jsonl_line_with_newline = jsonl_line;
@@ -341,7 +376,8 @@ pub fn spawn_stream_raw_logs_to_storage(
                     LogMsg::Finished => {
                         break;
                     }
-                    LogMsg::JsonPatch(_) | LogMsg::Ready => continue,
+                    // Already written to the log when the patch was seen.
+                    LogMsg::EntryTimestamp { .. } | LogMsg::Ready => continue,
                 }
             }
         }

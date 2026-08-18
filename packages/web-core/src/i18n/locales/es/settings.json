@@ -57,6 +57,10 @@
           "label": "Idioma",
           "placeholder": "Selecciona tu idioma",
           "helper": "Elige tu idioma preferido. El predeterminado del navegador sigue el idioma de tu sistema."
+        },
+        "messageTimestamps": {
+          "label": "Mostrar marcas de tiempo en los mensajes",
+          "helper": "Muestra la hora en que se escribió cada mensaje en la conversación."
         }
       },
       "taskExecution": {

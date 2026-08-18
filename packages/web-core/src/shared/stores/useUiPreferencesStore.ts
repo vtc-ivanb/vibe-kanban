@@ -37,6 +37,18 @@ const loadMobileFontScale = (): MobileFontScale => {
   return 'default';
 };
 
+const SHOW_MESSAGE_TIMESTAMPS_KEY = 'vk-show-message-timestamps';
+
+// On by default: only an explicit opt-out is stored.
+const loadShowMessageTimestamps = (): boolean => {
+  try {
+    return localStorage.getItem(SHOW_MESSAGE_TIMESTAMPS_KEY) !== 'false';
+  } catch {
+    // localStorage may be unavailable
+    return true;
+  }
+};
+
 export type KanbanViewMode = 'kanban' | 'list';
 
 export type ContextBarPosition =
@@ -350,6 +362,9 @@ type State = {
   // Mobile font scale
   mobileFontScale: MobileFontScale;
 
+  // Show the time each conversation entry was written
+  showMessageTimestamps: boolean;
+
   // Last selected organization and project (persisted via scratch store)
   selectedOrgId: string | null;
   selectedProjectId: string | null;
@@ -437,6 +452,7 @@ type State = {
 
   // Mobile font scale actions
   setMobileFontScale: (scale: MobileFontScale) => void;
+  setShowMessageTimestamps: (value: boolean) => void;
 
   // Last selected organization and project actions
   setSelectedOrgId: (orgId: string | null) => void;
@@ -481,6 +497,9 @@ export const useUiPreferencesStore = create<State>()((set, get) => ({
 
   // Mobile font scale
   mobileFontScale: loadMobileFontScale(),
+
+  // Show the time each conversation entry was written
+  showMessageTimestamps: loadShowMessageTimestamps(),
 
   // Last selected organization and project
   selectedOrgId: null,
@@ -836,6 +855,20 @@ export const useUiPreferencesStore = create<State>()((set, get) => ({
     set({ mobileFontScale: scale });
   },
 
+  // Message timestamp actions
+  setShowMessageTimestamps: (value) => {
+    try {
+      if (value) {
+        localStorage.removeItem(SHOW_MESSAGE_TIMESTAMPS_KEY);
+      } else {
+        localStorage.setItem(SHOW_MESSAGE_TIMESTAMPS_KEY, 'false');
+      }
+    } catch {
+      // localStorage may be unavailable
+    }
+    set({ showMessageTimestamps: value });
+  },
+
   // Last selected organization and project actions
   setSelectedOrgId: (orgId) => set({ selectedOrgId: orgId }),
   clearSelectedOrgId: () => set({ selectedOrgId: null }),
@@ -945,6 +978,13 @@ export function useMobileFontScale() {
   const scale = useUiPreferencesStore((s) => s.mobileFontScale);
   const set = useUiPreferencesStore((s) => s.setMobileFontScale);
   return [scale, set] as const;
+}
+
+// Hook for the message timestamp preference
+export function useShowMessageTimestamps() {
+  const show = useUiPreferencesStore((s) => s.showMessageTimestamps);
+  const set = useUiPreferencesStore((s) => s.setShowMessageTimestamps);
+  return [show, set] as const;
 }
 
 // Hook for workspace-specific panel state

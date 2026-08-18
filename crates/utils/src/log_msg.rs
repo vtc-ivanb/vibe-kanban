@@ -1,4 +1,5 @@
 use axum::{extract::ws::Message, response::sse::Event};
+use chrono::{DateTime, Utc};
 use json_patch::Patch;
 use serde::{Deserialize, Serialize};
 
@@ -9,6 +10,7 @@ pub const EV_SESSION_ID: &str = "session_id";
 pub const EV_MESSAGE_ID: &str = "message_id";
 pub const EV_READY: &str = "ready";
 pub const EV_FINISHED: &str = "finished";
+pub const EV_ENTRY_TIMESTAMP: &str = "entry_timestamp";
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub enum LogMsg {
@@ -19,6 +21,12 @@ pub enum LogMsg {
     MessageId(String),
     Ready,
     Finished,
+    /// When conversation entry `index` first appeared, recorded during the live
+    /// run so replays can show the original time rather than the time of replay.
+    EntryTimestamp {
+        index: usize,
+        ts: DateTime<Utc>,
+    },
 }
 
 impl LogMsg {
@@ -31,6 +39,7 @@ impl LogMsg {
             LogMsg::MessageId(_) => EV_MESSAGE_ID,
             LogMsg::Ready => EV_READY,
             LogMsg::Finished => EV_FINISHED,
+            LogMsg::EntryTimestamp { .. } => EV_ENTRY_TIMESTAMP,
         }
     }
 
@@ -46,6 +55,11 @@ impl LogMsg {
             LogMsg::MessageId(s) => Event::default().event(EV_MESSAGE_ID).data(s.clone()),
             LogMsg::Ready => Event::default().event(EV_READY).data(""),
             LogMsg::Finished => Event::default().event(EV_FINISHED).data(""),
+            // Purely a persistence record; clients read entry times off the
+            // conversation patches, so there is nothing useful to send.
+            LogMsg::EntryTimestamp { index, ts } => Event::default()
+                .event(EV_ENTRY_TIMESTAMP)
+                .data(format!(r#"{{"index":{index},"ts":"{}"}}"#, ts.to_rfc3339())),
         }
     }
 
@@ -79,6 +93,10 @@ impl LogMsg {
             LogMsg::MessageId(s) => EV_MESSAGE_ID.len() + s.len() + OVERHEAD,
             LogMsg::Ready => EV_READY.len() + OVERHEAD,
             LogMsg::Finished => EV_FINISHED.len() + OVERHEAD,
+            LogMsg::EntryTimestamp { .. } => {
+                const RFC3339_LEN: usize = 32;
+                EV_ENTRY_TIMESTAMP.len() + RFC3339_LEN + OVERHEAD
+            }
         }
     }
 }
