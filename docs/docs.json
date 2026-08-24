@@ -102,13 +102,6 @@
         ]
       },
       {
-        "group": "Self-Hosting",
-        "pages": [
-          "self-hosting/local-development",
-          "self-hosting/deploy-docker"
-        ]
-      },
-      {
         "group": "Integrations",
         "pages": [
           "integrations/github-integration",
