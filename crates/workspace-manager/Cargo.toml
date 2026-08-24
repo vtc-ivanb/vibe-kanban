@@ -8,7 +8,7 @@ db = { path = "../db" }
 git = { path = "../git" }
 utils = { path = "../utils" }
 worktree-manager = { path = "../worktree-manager" }
-sqlx = "0.8.6"
+sqlx = "0.9.0"
 tokio = { workspace = true }
 thiserror = { workspace = true }
 tracing = { workspace = true }

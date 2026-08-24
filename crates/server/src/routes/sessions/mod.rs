@@ -133,19 +133,17 @@ pub async fn delete_session(
     for process in processes {
         if process.status == ExecutionProcessStatus::Running
             && process.run_reason == ExecutionProcessRunReason::DevServer
-        {
-            if let Err(e) = deployment
+            && let Err(e) = deployment
                 .container()
                 .stop_execution(&process, ExecutionProcessStatus::Killed)
                 .await
-            {
-                tracing::error!(
-                    "Failed to stop dev server {} for session {}: {}",
-                    process.id,
-                    session.id,
-                    e
-                );
-            }
+        {
+            tracing::error!(
+                "Failed to stop dev server {} for session {}: {}",
+                process.id,
+                session.id,
+                e
+            );
         }
     }
 

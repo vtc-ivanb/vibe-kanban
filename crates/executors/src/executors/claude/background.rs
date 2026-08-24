@@ -237,8 +237,7 @@ mod tests {
             .lines()
             .filter(|l| !l.trim().is_empty())
             .map(|l| serde_json::from_str::<Value>(l).unwrap())
-            .filter(|v| v.get("type").and_then(|t| t.as_str()) == Some("result"))
-            .next_back()
+            .rfind(|v| v.get("type").and_then(|t| t.as_str()) == Some("result"))
             .expect("fixture has a final result");
         assert_eq!(
             final_result.get("origin").and_then(|o| o.get("kind")),

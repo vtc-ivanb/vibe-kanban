@@ -1640,8 +1640,6 @@ pub fn normalize_logs(
                     command,
                     cwd: _,
                     reason,
-                    parsed_cmd: _,
-                    proposed_execpolicy_amendment: _,
                     ..
                 }) => {
                     state.assistant = None;
@@ -1754,6 +1752,8 @@ pub fn normalize_logs(
                     source: _,
                     interaction_input: _,
                     process_id: _,
+                    plugin_id: _,
+                    script_path: _,
                 }) => {
                     state.assistant = None;
                     state.thinking = None;
@@ -1822,7 +1822,6 @@ pub fn normalize_logs(
                     exit_code,
                     duration: _,
                     formatted_output,
-                    process_id: _,
                     ..
                 }) => {
                     if let Some(mut command_state) = state.commands.remove(&call_id) {
@@ -2285,6 +2284,7 @@ pub fn normalize_logs(
                     turn_id: _,
                     questions: event_questions,
                     auto_resolution_ms: _,
+                    is_blocking: _,
                 }) => {
                     state.assistant = None;
                     state.thinking = None;
@@ -2414,7 +2414,8 @@ pub fn normalize_logs(
                 | EventMsg::SafetyBuffering(..)
                 | EventMsg::EnvironmentConnected(..)
                 | EventMsg::EnvironmentDisconnected(..)
-                | EventMsg::RawResponseCompleted(..) => {}
+                | EventMsg::RawResponseCompleted(..)
+                | EventMsg::ThreadQueueChanged(..) => {}
             }
         }
     });

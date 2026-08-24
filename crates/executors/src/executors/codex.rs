@@ -463,7 +463,7 @@ impl StandardCodingAgentExecutor for Codex {
 
 impl Codex {
     pub fn base_command() -> &'static str {
-        "npx -y @openai/codex@0.145.0"
+        "npx -y @openai/codex@0.149.1"
     }
 
     fn build_command_builder(&self) -> Result<CommandBuilder, CommandBuildError> {

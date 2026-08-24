@@ -55,6 +55,13 @@ async-trait = "0.1"
 aws-lc-sys = "=0.37.0"
 aws-lc-rs = "=1.16.0"
 
+# codex-otel (pulled in via codex-app-server-protocol) needs the `proxy` feature,
+# which only exists on OpenAI's forks. Mirrors the patches in openai/codex's
+# own workspace. Our relay crates stay on tokio-tungstenite 0.26 from crates.io.
+[patch.crates-io]
+tokio-tungstenite = { git = "https://github.com/openai-oss-forks/tokio-tungstenite", rev = "0e5b2d73aa18dd9f0a50ee9ff199d5aef7594186" }
+tungstenite = { git = "https://github.com/openai-oss-forks/tungstenite-rs", rev = "4fffad30fe373adbdcffab9545e9e9bf4f2fc19f" }
+
 [profile.release]
 debug = 1
 split-debuginfo = "packed"

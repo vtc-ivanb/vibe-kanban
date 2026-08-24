@@ -4,6 +4,7 @@
 //! the REST client does not cover well.
 
 use std::{
+    cmp::Reverse,
     ffi::{OsStr, OsString},
     io::Write,
     path::Path,
@@ -349,7 +350,7 @@ impl GhCli {
             })?;
 
         open_prs.extend(closed_prs);
-        open_prs.sort_by(|a, b| b.updated_at.cmp(&a.updated_at));
+        open_prs.sort_by_key(|pr| Reverse(pr.updated_at));
 
         Ok(open_prs
             .into_iter()

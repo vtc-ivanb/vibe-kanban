@@ -7,13 +7,13 @@
 //! without flooding the terminal.
 //!
 //! Activation (env vars, read once at startup):
-//!   - `VK_LOG_FILE=<path>`   Write logs to this exact file (created if needed,
-//!                            appended to otherwise).
-//!   - `VK_LOG_TO_FILE=1`     Write logs to `<asset_dir>/logs/vibe-kanban.log`.
-//!                            Ignored when `VK_LOG_FILE` is set.
+//!   - `VK_LOG_FILE=<path>` Write logs to this exact file (created if needed,
+//!     appended to otherwise).
+//!   - `VK_LOG_TO_FILE=1` Write logs to `<asset_dir>/logs/vibe-kanban.log`.
+//!     Ignored when `VK_LOG_FILE` is set.
 //!   - `VK_LOG_FILTER=<dirs>` Override the file sink's `EnvFilter` directives.
-//!                            Defaults to `DEFAULT_FILE_FILTER` below, which is
-//!                            tuned to capture the diff stream in detail.
+//!     Defaults to `DEFAULT_FILE_FILTER` below, which is tuned to capture the
+//!     diff stream in detail.
 //!
 //! When none of the activation vars are set, [`file_layer`] returns `(None,
 //! None)` and logging behaviour is unchanged.
