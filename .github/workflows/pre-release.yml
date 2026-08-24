@@ -52,13 +52,6 @@ jobs:
       - name: setup node
         uses: ./.github/actions/setup-node
 
-      - name: Setup SSH Agent for private dependencies
-        id: ssh-setup
-        if: ${{ github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name == github.repository }}
-        uses: webfactory/ssh-agent@dc588b651fe13675774614f8e6a936a468676387 # v0.9.0
-        with:
-          ssh-private-key: ${{ secrets.VK_PRIVATE_DEPLOY_KEY }}
-
       - name: Generate branch suffix
         id: branch
         run: |
@@ -136,25 +129,12 @@ jobs:
           echo "new_version=$new_version" >> $GITHUB_OUTPUT
           echo "new_tag=$new_tag" >> $GITHUB_OUTPUT
 
-      - name: Update remote crate lockfile
-        if: ${{ steps.ssh-setup.outcome == 'success' }}
-        run: cargo metadata --format-version 1 --manifest-path crates/remote/Cargo.toml > /dev/null
-
-      - name: Update relay-tunnel crate lockfile
-        run: cargo metadata --format-version 1 --manifest-path crates/relay-tunnel/Cargo.toml > /dev/null
-
-      - name: Stop SSH agent
-        if: ${{ steps.ssh-setup.outcome == 'success' }}
-        run: ssh-agent -k
-
       - name: Commit changes and create tag
         run: |
           git config --local user.email "action@github.com"
           git config --local user.name "GitHub Action"
           git add package.json pnpm-lock.yaml npx-cli/package.json npx-cli/package-lock.json packages/local-web/package.json crates/tauri-app/tauri.conf.json Cargo.lock
           git add $(find . -name Cargo.toml)
-          [ -f crates/remote/Cargo.lock ] && git add crates/remote/Cargo.lock || true
-          [ -f crates/relay-tunnel/Cargo.lock ] && git add crates/relay-tunnel/Cargo.lock || true
           git commit -m "chore: bump version to ${{ steps.version.outputs.new_version }}"
           git tag -a ${{ steps.version.outputs.new_tag }} -m "Release ${{ steps.version.outputs.new_tag }}"
           git push

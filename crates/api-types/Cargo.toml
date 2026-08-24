@@ -8,9 +8,6 @@ chrono = { version = "0.4", features = ["serde"] }
 schemars = { workspace = true }
 serde = { workspace = true }
 serde_json = { workspace = true }
-# Range, not a caret: the root workspace needs 0.9 (libsqlite3-sys 0.37, for
-# codex-state), while the excluded remote/relay-tunnel workspaces stay on 0.8.
-# Only the derive macros are used here, which are compatible across both.
-sqlx = { version = ">=0.8.6, <0.10", default-features = false, features = ["postgres", "uuid", "chrono", "derive"] }
+sqlx = { version = "0.9.0", default-features = false, features = ["postgres", "uuid", "chrono", "derive"] }
 ts-rs = { workspace = true }
 uuid = { version = "1.0", features = ["v4", "serde"] }
