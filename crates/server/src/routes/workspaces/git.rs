@@ -373,25 +373,33 @@ pub async fn merge_workspace(
         }
     };
 
+    // Run the generation agent in the selected repo's worktree so its git commands
+    // operate on the repo being merged. `session.agent_working_dir` may be None
+    // (workspace root, not a git repo) or point at a different repo in multi-repo
+    // workspaces, which would generate a message from the wrong diff or none at all.
+    // Workspace-relative, like every other coding-agent working dir.
+    let working_dir = services::services::merge_commit::generation_working_dir(
+        &repo.name,
+        repo.default_working_dir.as_deref(),
+    );
+
     // Decide whether we can resume the workspace's existing agent session. The
     // generation always runs as the configured default coding agent; when the
-    // workspace's most recent agent already uses that executor we resume its
-    // session (cheaper, and keeps the task context loaded), otherwise we
-    // cold-start a fresh session with the default agent. A workspace where no
-    // agent ever ran also cold-starts.
+    // workspace's most recent agent already uses that executor *and* ran in the
+    // same directory, we resume its session (cheaper, and keeps the task context
+    // loaded), otherwise we cold-start a fresh session with the default agent. A
+    // workspace where no agent ever ran also cold-starts.
     let latest_profile =
         ExecutionProcess::latest_executor_profile_for_session(pool, session.id).await?;
     let can_resume = services::services::merge_commit::can_resume_session(
         latest_profile.as_ref(),
         &default_profile,
+        session.agent_working_dir.as_deref(),
+        &working_dir,
     );
 
     let latest_session_info = CodingAgentTurn::find_latest_session_info(pool, session.id).await?;
-    // Run the generation agent in the selected repo's worktree so its git commands
-    // operate on the repo being merged. `session.agent_working_dir` may be None
-    // (workspace root, not a git repo) or point at a different repo in multi-repo
-    // workspaces, which would generate a message from the wrong diff or none at all.
-    let working_dir = Some(worktree_path.to_string_lossy().to_string());
+    let working_dir = Some(working_dir);
 
     let action_type = match (can_resume, latest_session_info) {
         (true, Some(info)) => {
