@@ -51,6 +51,12 @@ async-stream = "0.3"
 
 [target.'cfg(windows)'.dependencies]
 winsplit = "0.1.0"
+# codex-app-server-protocol -> codex-utils-pty copies wezterm's ConPTY code,
+# which assumes `winapi::ctypes::c_void` *is* `std::ffi::c_void`. winapi only
+# re-exports the std type when its `std` feature is on, otherwise it declares
+# its own opaque enum and the ConPTY code fails to compile. Nothing else in our
+# graph turns that feature on, so enable it here for feature unification.
+winapi = { version = "0.3.9", features = ["std"] }
 
 # On Linux, codex-protocol → reqwest → hyper-tls → native-tls pulls in
 # openssl-sys. Vendor it so musl cross-compile (no system OpenSSL) builds.
