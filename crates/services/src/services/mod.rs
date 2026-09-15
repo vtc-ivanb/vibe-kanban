@@ -12,6 +12,7 @@ pub mod file_search;
 pub mod filesystem;
 pub mod filesystem_watcher;
 pub mod merge_commit;
+pub mod merge_state;
 pub mod notification;
 pub mod oauth_credentials;
 pub mod pr_monitor;

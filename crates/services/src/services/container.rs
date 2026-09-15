@@ -17,6 +17,7 @@ use db::{
         execution_process_repo_state::{
             CreateExecutionProcessRepoState, ExecutionProcessRepoState,
         },
+        merge::Merge,
         repo::Repo,
         session::{CreateSession, Session, SessionError},
         workspace::{Workspace, WorkspaceError},
@@ -61,7 +62,7 @@ use worktree_manager::WorktreeError;
 use crate::services::{execution_process, notification::NotificationService};
 pub type ContainerRef = String;
 
-use crate::services::merge_commit;
+use crate::services::{merge_commit, merge_state};
 
 #[derive(Debug, Error)]
 pub enum ContainerError {
@@ -534,6 +535,98 @@ pub trait ContainerService {
         .await?;
 
         Ok(())
+    }
+
+    /// Names of the workspace's repos that still hold work not landed on their
+    /// target branch. Repos whose state can't be read are skipped rather than
+    /// reported, so an unreadable repo never keeps a workspace out of the
+    /// archive on its own.
+    async fn workspace_repos_with_unmerged_work(
+        &self,
+        workspace: &Workspace,
+    ) -> Result<Vec<String>, ContainerError> {
+        let pool = &self.db().pool;
+
+        let target_branches: HashMap<Uuid, String> =
+            WorkspaceRepo::find_by_workspace_id(pool, workspace.id)
+                .await?
+                .into_iter()
+                .map(|wr| (wr.repo_id, wr.target_branch))
+                .collect();
+
+        let mut merges_by_repo: HashMap<Uuid, Vec<Merge>> = HashMap::new();
+        for merge in Merge::find_by_workspace_id(pool, workspace.id).await? {
+            let repo_id = match &merge {
+                Merge::Direct(direct) => direct.repo_id,
+                Merge::Pr(pr) => pr.repo_id,
+            };
+            merges_by_repo.entry(repo_id).or_default().push(merge);
+        }
+
+        let mut unmerged = Vec::new();
+        for repo in WorkspaceRepo::find_repos_for_workspace(pool, workspace.id).await? {
+            let Some(target_branch) = target_branches.get(&repo.id) else {
+                continue;
+            };
+
+            let commits_ahead =
+                match self
+                    .git()
+                    .get_branch_status(&repo.path, &workspace.branch, target_branch)
+                {
+                    Ok((ahead, _behind)) => Some(ahead),
+                    Err(e) => {
+                        tracing::warn!(
+                            "Could not compare branch {} against {} in repo {}: {e}",
+                            workspace.branch,
+                            target_branch,
+                            repo.name
+                        );
+                        None
+                    }
+                };
+
+            let branch_head_time = self
+                .git()
+                .get_branch_commit_time(&repo.path, &workspace.branch)
+                .ok();
+
+            let merges = merges_by_repo
+                .get(&repo.id)
+                .map(Vec::as_slice)
+                .unwrap_or_default();
+            if merge_state::repo_has_unmerged_work(merges, commits_ahead, branch_head_time) {
+                unmerged.push(repo.name);
+            }
+        }
+
+        Ok(unmerged)
+    }
+
+    /// Archive a workspace once one of its repos merged, unless the user pinned
+    /// it or a sibling repo still has unmerged work. Multi-repo workspaces merge
+    /// one repo at a time, so the first merge must not sweep the rest away.
+    /// Returns whether the workspace was archived.
+    async fn archive_workspace_after_merge(
+        &self,
+        workspace: &Workspace,
+    ) -> Result<bool, ContainerError> {
+        if workspace.pinned {
+            return Ok(false);
+        }
+
+        let unmerged = self.workspace_repos_with_unmerged_work(workspace).await?;
+        if !unmerged.is_empty() {
+            tracing::info!(
+                "Leaving workspace {} active: unmerged work in {}",
+                workspace.id,
+                unmerged.join(", ")
+            );
+            return Ok(false);
+        }
+
+        self.archive_workspace(workspace.id).await?;
+        Ok(true)
     }
 
     /// Archive a workspace: set archived flag, stop running dev servers, and run archive script.

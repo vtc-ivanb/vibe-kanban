@@ -504,24 +504,15 @@ pub async fn attach_existing_pr(
             });
         }
 
-        // If PR is merged, archive workspace
-        if matches!(pr_info.status, MergeStatus::Merged) {
-            let open_pr_count = PullRequest::count_open_for_workspace(pool, workspace.id).await?;
-
-            if open_pr_count == 0 {
-                if !workspace.pinned
-                    && let Err(e) = deployment.container().archive_workspace(workspace.id).await
-                {
-                    tracing::error!("Failed to archive workspace {}: {}", workspace.id, e);
-                }
-            } else {
-                tracing::info!(
-                    "PR #{} was merged, leaving workspace {} active with {} open PR(s)",
-                    pr_info.number,
-                    workspace.id,
-                    open_pr_count
-                );
-            }
+        // If PR is merged, archive the workspace — unless another repo in it
+        // still has unmerged work.
+        if matches!(pr_info.status, MergeStatus::Merged)
+            && let Err(e) = deployment
+                .container()
+                .archive_workspace_after_merge(&workspace)
+                .await
+        {
+            tracing::error!("Failed to archive workspace {}: {}", workspace.id, e);
         }
 
         Ok(ResponseJson(ApiResponse::success(AttachPrResponse {

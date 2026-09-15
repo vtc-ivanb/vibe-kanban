@@ -1356,9 +1356,7 @@ impl LocalContainerService {
             });
         }
 
-        if !ctx.workspace.pinned
-            && let Err(e) = self.archive_workspace(ctx.workspace.id).await
-        {
+        if let Err(e) = self.archive_workspace_after_merge(&ctx.workspace).await {
             tracing::error!("Failed to archive workspace {}: {e}", ctx.workspace.id);
         }
 

@@ -858,6 +858,22 @@ impl GitService {
         Ok(oid)
     }
 
+    /// Committer time of a branch's head commit, without modifying HEAD.
+    pub fn get_branch_commit_time(
+        &self,
+        repo_path: &Path,
+        branch_name: &str,
+    ) -> Result<DateTime<Utc>, GitServiceError> {
+        let repo = self.open_repo(repo_path)?;
+        let branch = Self::find_branch(&repo, branch_name)?;
+        let seconds = branch.get().peel_to_commit()?.time().seconds();
+        DateTime::from_timestamp(seconds, 0).ok_or_else(|| {
+            GitServiceError::InvalidRepository(format!(
+                "Branch '{branch_name}' head has an out-of-range commit time: {seconds}"
+            ))
+        })
+    }
+
     pub fn get_fork_point(
         &self,
         worktree_path: &Path,

@@ -172,7 +172,12 @@ mod tests {
         // Multi-repo workspace: the agent ran at the workspace root, the
         // generation runs in the merged repo's worktree → cold start.
         assert!(!can_resume_session(Some(&latest), &default, None, "repo"));
-        assert!(!can_resume_session(Some(&latest), &default, Some(""), "repo"));
+        assert!(!can_resume_session(
+            Some(&latest),
+            &default,
+            Some(""),
+            "repo"
+        ));
 
         // A different repo of the same workspace → cold start.
         assert!(!can_resume_session(

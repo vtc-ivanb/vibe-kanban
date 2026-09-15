@@ -229,8 +229,10 @@ async fn merge_with_fallback_message(
         });
     }
 
-    if !workspace.pinned
-        && let Err(e) = deployment.container().archive_workspace(workspace.id).await
+    if let Err(e) = deployment
+        .container()
+        .archive_workspace_after_merge(workspace)
+        .await
     {
         tracing::error!("Failed to archive workspace {}: {}", workspace.id, e);
     }

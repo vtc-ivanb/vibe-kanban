@@ -182,11 +182,15 @@ impl<C: ContainerService + Send + Sync + 'static> PrMonitorService<C> {
 
         if open_pr_count == 0 {
             info!(
-                "PR #{} was merged, archiving workspace {}",
+                "PR #{} was merged, no open PRs left for workspace {}",
                 pr_number, workspace.id
             );
-            if !workspace.pinned
-                && let Err(e) = self.container.archive_workspace(workspace.id).await
+            // Archives unless the workspace is pinned or a repo in it still has
+            // unmerged work.
+            if let Err(e) = self
+                .container
+                .archive_workspace_after_merge(&workspace)
+                .await
             {
                 error!("Failed to archive workspace {}: {}", workspace.id, e);
             }
