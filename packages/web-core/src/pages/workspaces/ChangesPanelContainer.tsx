@@ -7,12 +7,16 @@ import {
   PlusIcon,
 } from '@phosphor-icons/react';
 import {
-  FileDiff,
-  Virtualizer,
+  CodeView,
   WorkerPoolContextProvider,
+  type CodeViewHandle,
+  type CodeViewReactOptions,
 } from '@pierre/diffs/react';
 import type {
+  CodeViewDiffItem,
+  CodeViewItem,
   DiffLineAnnotation,
+  LineAnnotation,
   AnnotationSide,
   VirtualFileMetrics,
 } from '@pierre/diffs';
@@ -22,7 +26,6 @@ const WorkerUrl = new URL(
 ).href;
 import { sortDiffs } from '@/shared/lib/fileTreeUtils';
 import { useChangesView } from '@/shared/hooks/useChangesView';
-import { useScrollSyncStateMachine } from '@/shared/hooks/useScrollSyncStateMachine';
 import { useFileInViewStore } from '@/shared/stores/useFileInViewStore';
 import {
   useDiffs,
@@ -90,24 +93,31 @@ function shouldAutoCollapse(diff: Diff): boolean {
 const IS_MOBILE = isRealMobileDevice();
 const NOOP = () => {};
 
-// Pierre's built-in size estimates (line 20px, header 44px, etc). These rarely
-// match our themed CSS, so we measure the real geometry once and override them.
+// Vertical rhythm of the file list. Replaces the flex gap/padding the old
+// Virtualizer layout used, so CodeView can account for it while estimating.
+const CODE_VIEW_LAYOUT = { paddingTop: 4, paddingBottom: 8, gap: 4 };
+
+// How long a scroll-to-file request waits for its file to show up in the list.
+const PENDING_SCROLL_TTL_MS = 10_000;
+
+// Pierre estimates unrendered items from these (line 20px, header 44px, …).
+// They rarely match our themed CSS, so we measure the real geometry once and
+// hand the measurements back through `itemMetrics`.
 const FALLBACK_METRICS: VirtualFileMetrics = {
-  hunkLineCount: 50,
+  hunkLineCount: 1,
   lineHeight: 20,
   diffHeaderHeight: 44,
   hunkSeparatorHeight: 32,
-  fileGap: 8,
+  spacing: 8,
 };
 
-// Cached for the session so subsequent mounts render with correct metrics from
-// the first frame (no remount). Geometry only depends on font/theme CSS, which
-// is stable within a session.
+// Cached for the session so later mounts estimate correctly from the first
+// frame. Geometry only depends on font/theme CSS, which is stable per session.
 let cachedMetrics: VirtualFileMetrics | null = null;
 
 // Read the real rendered line/header/separator heights from a live diff so the
-// virtualizer's size estimates match the DOM. Returns null until at least one
-// expanded diff has rendered a measurable line.
+// estimates match the DOM. Returns null until at least one expanded diff has
+// rendered a measurable line.
 function measureDiffMetrics(
   scrollRoot: HTMLElement
 ): VirtualFileMetrics | null {
@@ -154,37 +164,20 @@ function measureDiffMetrics(
       hunkSeparatorHeight > 0
         ? hunkSeparatorHeight
         : FALLBACK_METRICS.hunkSeparatorHeight,
-    fileGap: FALLBACK_METRICS.fileGap,
+    spacing: FALLBACK_METRICS.spacing,
   };
 }
 
 const PIERRE_DIFFS_THEME_CSS = `
-  :host {
-    position: relative;
-  }
-
   [data-diffs-header] {
     background-color: hsl(var(--bg-primary));
     min-height: 40px;
-    position: sticky;
-    top: 0;
-    z-index: 10;
     cursor: pointer;
     padding-inline: 12px;
     border-radius: 4px 4px 0 0;
     font-family: 'IBM Plex Mono', monospace;
     font-size: 0.875rem;
     line-height: 1.25rem;
-  }
-
-  [data-diffs-header]::before {
-    content: '';
-    position: absolute;
-    top: -6px;
-    left: -4px;
-    right: -4px;
-    height: 6px;
-    background-color: hsl(var(--bg-secondary));
   }
 
   [data-diffs-header] [data-additions-count],
@@ -202,10 +195,6 @@ const PIERRE_DIFFS_THEME_CSS = `
     gap: 8px;
   }
 
-  [data-code] {
-    border-radius: 0 0 4px 4px;
-  }
-
   [data-separator="line-info"][data-separator-first] {
     margin-top: 4px;
   }
@@ -213,34 +202,8 @@ const PIERRE_DIFFS_THEME_CSS = `
     margin-bottom: 4px;
   }
 
-  [data-indicators='classic'] [data-column-content] {
-    position: relative;
-    padding-inline-start: 34px;
-  }
-
-  [data-indicators='classic'] [data-line-type='change-addition'] [data-column-content]::before,
-  [data-indicators='classic'] [data-line-type='change-deletion'] [data-column-content]::before {
-    left: 22px;
-  }
-
-  [data-hover-slot] {
-    right: auto;
-    left: calc(var(--diffs-column-number-width, 3ch) - 25px);
-    width: 22px;
-  }
-
-  [data-annotation-content] {
-    grid-column: 1 / -1;
-    left: 0;
-    width: var(--diffs-column-width, 100%);
-    max-width: 100%;
-  }
-  
-  [data-line-annotation] {
-    grid-column: 1 / -1;
-  }
-
   [data-code] {
+    border-radius: 0 0 4px 4px;
     padding-bottom: 0;
   }
   [data-code]::-webkit-scrollbar {
@@ -257,44 +220,14 @@ const PIERRE_DIFFS_THEME_CSS = `
   [data-code]:hover::-webkit-scrollbar-thumb {
     background-color: hsl(var(--text-low) / 0.3);
   }
-
-  [data-diff][data-theme-type='light'] {
-    --diffs-gap-style: none;
-    --diffs-light-bg: hsl(var(--bg-primary));
-    --diffs-bg-context-override: hsl(var(--bg-primary));
-    --diffs-bg-separator-override: hsl(var(--bg-primary));
-    --diffs-light-addition-color: hsl(160, 77%, 35%);
-    --diffs-bg-addition-override: hsl(160, 77%, 88%);
-    --diffs-bg-addition-number-override: hsl(160, 77%, 85%);
-    --diffs-bg-addition-hover-override: hsl(160, 77%, 82%);
-    --diffs-light-deletion-color: hsl(10, 100%, 40%);
-    --diffs-bg-deletion-override: hsl(10, 100%, 90%);
-    --diffs-bg-deletion-number-override: hsl(10, 100%, 87%);
-    --diffs-bg-deletion-hover-override: hsl(10, 100%, 84%);
-    --diffs-fg-number-override: hsl(var(--text-low));
-  }
-
-  [data-diff][data-theme-type='dark'] {
-    --diffs-gap-style: none;
-    --diffs-dark-bg: hsl(var(--bg-panel));
-    --diffs-bg-context-override: hsl(var(--bg-panel));
-    --diffs-bg-separator-override: hsl(var(--bg-panel));
-    --diffs-bg-hover-override: hsl(0, 0%, 22%);
-    --diffs-dark-addition-color: hsl(130, 50%, 50%);
-    --diffs-bg-addition-override: hsl(130, 30%, 20%);
-    --diffs-bg-addition-number-override: hsl(130, 30%, 18%);
-    --diffs-bg-addition-hover-override: hsl(130, 30%, 25%);
-    --diffs-dark-deletion-color: hsl(12, 50%, 55%);
-    --diffs-bg-deletion-override: hsl(12, 30%, 18%);
-    --diffs-bg-deletion-number-override: hsl(12, 30%, 16%);
-    --diffs-bg-deletion-hover-override: hsl(12, 30%, 23%);
-    --diffs-fg-number-override: hsl(var(--text-low));
-  }
 `;
 
 type ExtendedCommentAnnotation =
   | CommentAnnotation
   | { type: 'draft'; draft: ReviewDraft; widgetKey: string };
+
+type ChangesAnnotation = DiffLineAnnotation<ExtendedCommentAnnotation>;
+type ChangesItem = CodeViewDiffItem<ExtendedCommentAnnotation>;
 
 function mapSideToAnnotationSide(side: DiffSide): AnnotationSide {
   return side === DiffSide.Old ? 'deletions' : 'additions';
@@ -324,50 +257,17 @@ function getCodeLineForComment(
   return getLineContent(content, lineNumber);
 }
 
-function scrollToLineInDiff(fileEl: HTMLElement, lineNumber: number): void {
-  const container = fileEl.querySelector('diffs-container');
-  const shadowRoot = container?.shadowRoot ?? null;
-  if (shadowRoot) {
-    const lineEl = shadowRoot.querySelector(`[data-line="${lineNumber}"]`);
-    if (lineEl instanceof HTMLElement) {
-      lineEl.scrollIntoView({ behavior: 'instant', block: 'nearest' });
-    }
-  }
-}
-
-const DIFF_CACHE_MAX = 200;
-
-class LruCache<K, V> {
-  private map = new Map<K, V>();
-  constructor(private max: number) {}
-  get(key: K): V | undefined {
-    const val = this.map.get(key);
-    if (val !== undefined) {
-      this.map.delete(key);
-      this.map.set(key, val);
-    }
-    return val;
-  }
-  set(key: K, val: V): void {
-    if (this.map.has(key)) this.map.delete(key);
-    else if (this.map.size >= this.max) {
-      this.map.delete(this.map.keys().next().value!);
-    }
-    this.map.set(key, val);
-  }
-  clear(): void {
-    this.map.clear();
-  }
-}
-
-const fileDiffCache = new LruCache<
+// Parsed diffs are cached per path for as long as the file is in the changes
+// list — a fixed-size LRU would thrash on large diffs (every recompute evicts
+// the entry the next file is about to need) and re-parse every file.
+const fileDiffCache = new Map<
   string,
   {
     diff: Diff;
     ignoreWhitespace: boolean;
     result: ReturnType<typeof transformDiffToFileDiffMetadata>;
   }
->(DIFF_CACHE_MAX);
+>();
 
 function getCachedFileDiffMetadata(diff: Diff, ignoreWhitespace: boolean) {
   const path = diff.newPath || diff.oldPath || '';
@@ -384,26 +284,69 @@ function getCachedFileDiffMetadata(diff: Diff, ignoreWhitespace: boolean) {
   return result;
 }
 
-interface DiffFileItemProps {
-  diff: Diff;
-  initialExpanded: boolean;
-  workspaceId: string;
-  metrics?: VirtualFileMetrics;
+function getDiffPath(diff: Diff): string {
+  return diff.newPath || diff.oldPath || '';
 }
 
-const DiffFileItem = memo(function DiffFileItem({
-  diff,
-  initialExpanded,
-  workspaceId,
-  metrics,
-}: DiffFileItemProps) {
-  const { t } = useTranslation('common');
-  const filePath = diff.newPath || diff.oldPath || '';
-  const expandKey = `diff:${filePath}`;
+function expandKeyFor(path: string): string {
+  return `diff:${path}`;
+}
 
-  const expanded = useUiPreferencesStore(
-    (s) => s.expanded[expandKey] ?? initialExpanded
+// CodeView reconciles a controlled item only when its `version` changes, so a
+// version has to be published whenever the item's rendered inputs change. The
+// signature therefore covers comment bodies too: editing a comment keeps its
+// id, and without the text here the edit would never reach the rendered card.
+// Drafts are keyed by widget only — the widget owns its text as local state,
+// so including it would re-version the file on every keystroke.
+function annotationSignature(annotations: ChangesAnnotation[]): string {
+  return JSON.stringify(
+    annotations.map((annotation) => {
+      const { metadata } = annotation;
+      switch (metadata.type) {
+        case 'draft':
+          return [
+            annotation.side,
+            annotation.lineNumber,
+            'draft',
+            metadata.widgetKey,
+          ];
+        case 'github':
+          return [
+            annotation.side,
+            annotation.lineNumber,
+            'github',
+            metadata.comment.id,
+            metadata.comment.body,
+          ];
+        default:
+          return [
+            annotation.side,
+            annotation.lineNumber,
+            'review',
+            metadata.comment.id,
+            metadata.comment.text,
+          ];
+      }
+    })
   );
+}
+
+interface ChangesPanelContainerProps {
+  className: string;
+  workspaceId: string;
+}
+
+export const ChangesPanelContainer = memo(function ChangesPanelContainer({
+  className,
+  workspaceId,
+}: ChangesPanelContainerProps) {
+  const { t } = useTranslation('common');
+  const diffs = useDiffs();
+  const { registerScrollToFile } = useChangesView();
+  const [metrics, setMetrics] = useState<VirtualFileMetrics | null>(
+    cachedMetrics
+  );
+  const scrollRootRef = useRef<HTMLDivElement | null>(null);
 
   const { theme } = useTheme();
   const actualTheme = getActualTheme(theme);
@@ -417,49 +360,185 @@ const DiffFileItem = memo(function DiffFileItem({
 
   const showGitHubComments = useShowGitHubComments();
   const getGitHubCommentsForFile = useGetGitHubCommentsForFile();
+  const expandedPrefs = useUiPreferencesStore((s) => s.expanded);
 
   const openInEditor = useOpenInEditor(workspaceId);
 
-  const fileDiffMetadata = useMemo(
-    () => getCachedFileDiffMetadata(diff, ignoreWhitespace),
-    [diff, ignoreWhitespace]
+  const codeViewRef = useRef<CodeViewHandle<
+    ExtendedCommentAnnotation,
+    undefined
+  > | null>(null);
+
+  const sortedDiffs = useMemo(() => sortDiffs(diffs), [diffs]);
+
+  // Files auto-collapse the first time we see them; after that the user's
+  // expand/collapse choice (persisted in ui preferences) wins. The decision is
+  // kept per path for the lifetime of the panel so a later diff update (more
+  // lines streamed in) can't silently re-collapse a file.
+  const defaultCollapsedRef = useRef(new Map<string, boolean>());
+  const defaultCollapsed = useMemo(() => {
+    const map = defaultCollapsedRef.current;
+    for (const diff of sortedDiffs) {
+      const path = getDiffPath(diff);
+      if (!map.has(path)) map.set(path, shouldAutoCollapse(diff));
+    }
+    return map;
+  }, [sortedDiffs]);
+
+  const diffByPath = useMemo(() => {
+    const map = new Map<string, Diff>();
+    for (const diff of sortedDiffs) map.set(getDiffPath(diff), diff);
+    return map;
+  }, [sortedDiffs]);
+  const diffByPathRef = useRef(diffByPath);
+  diffByPathRef.current = diffByPath;
+
+  const commentsByPath = useMemo(() => {
+    const map = new Map<string, typeof comments>();
+    for (const comment of comments) {
+      const list = map.get(comment.filePath);
+      if (list) list.push(comment);
+      else map.set(comment.filePath, [comment]);
+    }
+    return map;
+  }, [comments]);
+
+  // Keep annotation arrays referentially stable while their contents are
+  // unchanged, so unrelated review activity doesn't re-version every item.
+  const annotationCacheRef = useRef(
+    new Map<string, { signature: string; value: ChangesAnnotation[] }>()
   );
 
-  const commentsForFile = useMemo(
-    () => comments.filter((c) => c.filePath === filePath),
-    [comments, filePath]
-  );
+  const annotationsByPath = useMemo(() => {
+    const cache = annotationCacheRef.current;
+    const next = new Map<string, ChangesAnnotation[]>();
 
-  const githubCommentsForFile = useMemo(
-    () => (showGitHubComments ? getGitHubCommentsForFile(filePath) : []),
-    [showGitHubComments, getGitHubCommentsForFile, filePath]
-  );
-
-  const annotations = useMemo(() => {
-    const base = transformCommentsToAnnotations(
-      commentsForFile,
-      githubCommentsForFile,
-      filePath
-    ) as DiffLineAnnotation<ExtendedCommentAnnotation>[];
-
-    const draftAnns: DiffLineAnnotation<ExtendedCommentAnnotation>[] = [];
-    Object.entries(drafts).forEach(([key, draft]) => {
-      if (!draft || draft.filePath !== filePath) return;
-      draftAnns.push({
+    const draftsByPath = new Map<string, ChangesAnnotation[]>();
+    Object.entries(drafts).forEach(([widgetKey, draft]) => {
+      if (!draft) return;
+      const list = draftsByPath.get(draft.filePath) ?? [];
+      list.push({
         side: mapSideToAnnotationSide(draft.side),
         lineNumber: draft.lineNumber,
-        metadata: { type: 'draft', draft, widgetKey: key },
+        metadata: { type: 'draft', draft, widgetKey },
       });
+      draftsByPath.set(draft.filePath, list);
     });
 
-    return base.length > 0 || draftAnns.length > 0
-      ? [...base, ...draftAnns]
-      : undefined;
-  }, [commentsForFile, githubCommentsForFile, filePath, drafts]);
+    const paths = new Set<string>([
+      ...commentsByPath.keys(),
+      ...draftsByPath.keys(),
+    ]);
+    if (showGitHubComments) {
+      for (const path of diffByPath.keys()) paths.add(path);
+    }
+
+    for (const path of paths) {
+      const base = transformCommentsToAnnotations(
+        commentsByPath.get(path) ?? [],
+        showGitHubComments ? getGitHubCommentsForFile(path) : [],
+        path
+      ) as ChangesAnnotation[];
+      const value = [...base, ...(draftsByPath.get(path) ?? [])];
+      if (value.length === 0) continue;
+
+      const signature = annotationSignature(value);
+      const cached = cache.get(path);
+      if (cached && cached.signature === signature) {
+        next.set(path, cached.value);
+        continue;
+      }
+      cache.set(path, { signature, value });
+      next.set(path, value);
+    }
+
+    for (const path of [...cache.keys()]) {
+      if (!next.has(path)) cache.delete(path);
+    }
+
+    return next;
+  }, [
+    commentsByPath,
+    drafts,
+    showGitHubComments,
+    getGitHubCommentsForFile,
+    diffByPath,
+  ]);
+
+  const itemVersionsRef = useRef(
+    new Map<
+      string,
+      {
+        fileDiff: unknown;
+        annotations: unknown;
+        collapsed: boolean;
+        version: number;
+      }
+    >()
+  );
+
+  const items = useMemo(() => {
+    const versions = itemVersionsRef.current;
+    const next: ChangesItem[] = sortedDiffs.map((diff) => {
+      const path = getDiffPath(diff);
+      const fileDiff = getCachedFileDiffMetadata(diff, ignoreWhitespace);
+      const annotations = annotationsByPath.get(path);
+      const collapsed =
+        expandedPrefs[expandKeyFor(path)] === undefined
+          ? (defaultCollapsed.get(path) ?? false)
+          : !expandedPrefs[expandKeyFor(path)];
+
+      const previous = versions.get(path);
+      const changed =
+        previous === undefined ||
+        previous.fileDiff !== fileDiff ||
+        previous.annotations !== annotations ||
+        previous.collapsed !== collapsed;
+      const version = changed ? (previous?.version ?? 0) + 1 : previous.version;
+      if (changed) {
+        versions.set(path, { fileDiff, annotations, collapsed, version });
+      }
+
+      return {
+        id: path,
+        type: 'diff' as const,
+        fileDiff,
+        annotations,
+        collapsed,
+        version,
+      };
+    });
+
+    return next;
+  }, [
+    sortedDiffs,
+    ignoreWhitespace,
+    annotationsByPath,
+    expandedPrefs,
+    defaultCollapsed,
+  ]);
+
+  const orderedPathsRef = useRef<string[]>([]);
+
+  // Pruning and ref publishing happen on commit, never during render: an
+  // abandoned render must not drop a version entry, or the path could come
+  // back at a version CodeView has already seen and the update would be
+  // rejected as a no-op.
+  useEffect(() => {
+    orderedPathsRef.current = items.map((item) => item.id);
+    const live = new Set(orderedPathsRef.current);
+    for (const path of [...itemVersionsRef.current.keys()]) {
+      if (!live.has(path)) itemVersionsRef.current.delete(path);
+    }
+    for (const path of [...fileDiffCache.keys()]) {
+      if (!live.has(path)) fileDiffCache.delete(path);
+    }
+  }, [items]);
 
   const handleLineClick = useCallback(
-    (props: { lineNumber: number; annotationSide: AnnotationSide }) => {
-      const { lineNumber, annotationSide } = props;
+    (filePath: string, lineNumber: number, annotationSide: AnnotationSide) => {
+      const diff = diffByPathRef.current.get(filePath);
+      if (!diff) return;
       const splitSide = mapAnnotationSideToSplitSide(annotationSide);
       const widgetKey = `${filePath}-${splitSide}-${lineNumber}`;
       if (draftsRef.current[widgetKey]) return;
@@ -473,104 +552,100 @@ const DiffFileItem = memo(function DiffFileItem({
         ...(codeLine !== undefined ? { codeLine } : {}),
       });
     },
-    [filePath, diff, setDraft]
+    [setDraft]
   );
 
-  const options = useMemo(
-    () => ({
-      diffStyle:
-        globalMode === 'split' ? ('split' as const) : ('unified' as const),
-      diffIndicators: 'classic' as const,
-      themeType: actualTheme,
-      overflow: wrapText ? ('wrap' as const) : ('scroll' as const),
-      hunkSeparators: 'line-info' as const,
-      collapsed: !expanded,
-      enableHoverUtility: true,
-      onLineClick: handleLineClick,
-      theme: { dark: 'github-dark', light: 'github-light' } as const,
-      unsafeCSS: PIERRE_DIFFS_THEME_CSS,
-    }),
-    [globalMode, actualTheme, wrapText, expanded, handleLineClick]
-  );
+  const handleToggle = useCallback((path: string) => {
+    const key = expandKeyFor(path);
+    useUiPreferencesStore
+      .getState()
+      .toggleExpanded(key, !(defaultCollapsedRef.current.get(path) ?? false));
+  }, []);
 
-  const handleToggle = useCallback(() => {
-    useUiPreferencesStore.getState().toggleExpanded(expandKey, initialExpanded);
-  }, [expandKey, initialExpanded]);
+  const handleCopyFilePath = useCallback((path: string) => {
+    void writeClipboardViaBridge(path);
+  }, []);
 
-  const handleCopyFilePath = useCallback(() => {
-    void writeClipboardViaBridge(filePath);
-  }, [filePath]);
-
-  const handleOpenInIde = useCallback(() => {
-    openInEditor({ filePath });
-  }, [openInEditor, filePath]);
-
-  const githubCommentCount = githubCommentsForFile.length;
-
-  const additions = diff.additions ?? 0;
-  const deletions = diff.deletions ?? 0;
-
-  const renderHeaderMetadata = useCallback(
-    () => (
-      <div
-        className="flex items-center gap-2 shrink-0 text-xs"
-        onClick={(e) => e.stopPropagation()}
-      >
-        <CopyButton
-          onCopy={handleCopyFilePath}
-          disabled={false}
-          iconSize="size-icon-xs"
-          icon={CopyIcon}
-        />
-        {(additions > 0 || deletions > 0) && (
-          <span className="inline-flex items-center gap-1 font-mono">
-            {additions > 0 && (
-              <span className="text-success">+{additions}</span>
-            )}
-            {deletions > 0 && <span className="text-error">-{deletions}</span>}
-          </span>
-        )}
-        {githubCommentCount > 0 && (
-          <span className="inline-flex items-center gap-0.5 text-low">
-            <GithubLogoIcon className="size-icon-xs" weight="fill" />
-            {githubCommentCount}
-          </span>
-        )}
-        {!IS_MOBILE && (
-          <OpenInIdeButton
-            onClick={handleOpenInIde}
-            className="size-icon-xs p-0"
-          />
-        )}
-        <CaretDownIcon
-          className={`size-icon-xs text-low transition-transform cursor-pointer${!expanded ? ' -rotate-90' : ''}`}
-          onClick={handleToggle}
-        />
-      </div>
-    ),
-    [
-      handleCopyFilePath,
-      handleOpenInIde,
-      expanded,
-      handleToggle,
-      githubCommentCount,
-      additions,
-      deletions,
-    ]
-  );
-
-  const FileIcon = useMemo(
-    () => getFileIcon(filePath, actualTheme),
-    [filePath, actualTheme]
+  const handleOpenInIde = useCallback(
+    (filePath: string) => {
+      openInEditor({ filePath });
+    },
+    [openInEditor]
   );
 
   const renderHeaderPrefix = useCallback(
-    () => <FileIcon className="size-icon-base shrink-0" />,
-    [FileIcon]
+    (item: CodeViewItem<ExtendedCommentAnnotation>) => {
+      const FileIcon = getFileIcon(item.id, actualTheme);
+      return <FileIcon className="size-icon-base shrink-0" />;
+    },
+    [actualTheme]
+  );
+
+  const renderHeaderMetadata = useCallback(
+    (item: CodeViewItem<ExtendedCommentAnnotation>) => {
+      const path = item.id;
+      const diff = diffByPathRef.current.get(path);
+      const additions = diff?.additions ?? 0;
+      const deletions = diff?.deletions ?? 0;
+      const githubCommentCount = showGitHubComments
+        ? getGitHubCommentsForFile(path).length
+        : 0;
+      const collapsed = item.collapsed ?? false;
+
+      return (
+        <div
+          className="flex items-center gap-2 shrink-0 text-xs"
+          onClick={(e) => e.stopPropagation()}
+        >
+          <CopyButton
+            onCopy={() => handleCopyFilePath(path)}
+            disabled={false}
+            iconSize="size-icon-xs"
+            icon={CopyIcon}
+          />
+          {(additions > 0 || deletions > 0) && (
+            <span className="inline-flex items-center gap-1 font-mono">
+              {additions > 0 && (
+                <span className="text-success">+{additions}</span>
+              )}
+              {deletions > 0 && (
+                <span className="text-error">-{deletions}</span>
+              )}
+            </span>
+          )}
+          {githubCommentCount > 0 && (
+            <span className="inline-flex items-center gap-0.5 text-low">
+              <GithubLogoIcon className="size-icon-xs" weight="fill" />
+              {githubCommentCount}
+            </span>
+          )}
+          {!IS_MOBILE && (
+            <OpenInIdeButton
+              onClick={() => handleOpenInIde(path)}
+              className="size-icon-xs p-0"
+            />
+          )}
+          <CaretDownIcon
+            className={`size-icon-xs text-low transition-transform cursor-pointer${collapsed ? ' -rotate-90' : ''}`}
+            onClick={() => handleToggle(path)}
+          />
+        </div>
+      );
+    },
+    [
+      showGitHubComments,
+      getGitHubCommentsForFile,
+      handleCopyFilePath,
+      handleOpenInIde,
+      handleToggle,
+    ]
   );
 
   const renderAnnotation = useCallback(
-    (annotation: DiffLineAnnotation<ExtendedCommentAnnotation>) => {
+    (
+      annotation: ChangesAnnotation | LineAnnotation<ExtendedCommentAnnotation>,
+      item: CodeViewItem<ExtendedCommentAnnotation>
+    ) => {
       const { metadata } = annotation;
 
       if (metadata.type === 'draft') {
@@ -591,13 +666,16 @@ const DiffFileItem = memo(function DiffFileItem({
             comment={githubComment}
             theme={actualTheme}
             onCopyToUserComment={() => {
-              const codeLine = getCodeLineForComment(
-                diff,
-                githubComment.lineNumber,
-                githubComment.side
-              );
+              const diff = diffByPathRef.current.get(item.id);
+              const codeLine = diff
+                ? getCodeLineForComment(
+                    diff,
+                    githubComment.lineNumber,
+                    githubComment.side
+                  )
+                : undefined;
               addComment({
-                filePath,
+                filePath: item.id,
                 lineNumber: githubComment.lineNumber,
                 side: githubComment.side,
                 text: githubComment.body,
@@ -610,270 +688,67 @@ const DiffFileItem = memo(function DiffFileItem({
 
       return <ReviewCommentRenderer comment={metadata.comment} />;
     },
-    [diff, filePath, addComment, actualTheme]
+    [actualTheme, addComment]
   );
 
-  const renderHoverUtility = useCallback(
+  const renderGutterUtility = useCallback(
     (
       getHoveredLine: () =>
-        | { lineNumber: number; side: AnnotationSide }
-        | undefined
+        | { lineNumber: number; side?: AnnotationSide }
+        | undefined,
+      item: CodeViewItem<ExtendedCommentAnnotation>
     ) => (
       <button
         className="flex items-center justify-center size-icon-base rounded text-brand bg-brand/20 transition-transform hover:scale-110"
         onClick={() => {
           const line = getHoveredLine();
           if (!line) return;
-          const { side, lineNumber } = line;
-          const splitSide = mapAnnotationSideToSplitSide(side);
-          const widgetKey = `${filePath}-${splitSide}-${lineNumber}`;
-          if (draftsRef.current[widgetKey]) return;
-
-          const codeLine = getCodeLineForComment(diff, lineNumber, splitSide);
-          setDraft(widgetKey, {
-            filePath,
-            side: splitSide,
-            lineNumber,
-            text: '',
-            ...(codeLine !== undefined ? { codeLine } : {}),
-          });
+          handleLineClick(item.id, line.lineNumber, line.side ?? 'additions');
         }}
         title={t('comments.addReviewComment')}
       >
         <PlusIcon className="size-3.5" weight="bold" />
       </button>
     ),
-    [filePath, diff, setDraft, t]
+    [handleLineClick, t]
   );
 
-  return (
-    <div data-diff-path={filePath} className="rounded-sm">
-      <FileDiff<ExtendedCommentAnnotation>
-        fileDiff={fileDiffMetadata}
-        options={options}
-        metrics={metrics}
-        lineAnnotations={annotations}
-        renderAnnotation={annotations ? renderAnnotation : undefined}
-        renderHeaderPrefix={renderHeaderPrefix}
-        renderHeaderMetadata={renderHeaderMetadata}
-        renderHoverUtility={expanded ? renderHoverUtility : undefined}
-      />
-    </div>
-  );
-});
-
-interface ChangesPanelContainerProps {
-  className: string;
-  workspaceId: string;
-}
-
-const MOUNT_BATCH_SIZE = 8;
-
-export const ChangesPanelContainer = memo(function ChangesPanelContainer({
-  className,
-  workspaceId,
-}: ChangesPanelContainerProps) {
-  const diffs = useDiffs();
-  const { registerScrollToFile } = useChangesView();
-  const [processedPaths] = useState(() => new Set<string>());
-  const [mountedCount, setMountedCount] = useState(0);
-  const [metrics, setMetrics] = useState<VirtualFileMetrics | null>(
-    cachedMetrics
-  );
-  const rafRef = useRef<number | null>(null);
-
-  const diffItems = useMemo(() => {
-    const sorted = sortDiffs(diffs);
-    return sorted.map((diff) => {
-      const path = diff.newPath || diff.oldPath || '';
-
-      let initialExpanded = true;
-      if (!processedPaths.has(path)) {
-        processedPaths.add(path);
-        initialExpanded = !shouldAutoCollapse(diff);
-      }
-
-      return { diff, initialExpanded };
-    });
-  }, [diffs, processedPaths]);
-
-  useEffect(() => {
-    if (diffItems.length === 0) {
-      setMountedCount(0);
-      return;
-    }
-
-    if (rafRef.current !== null) {
-      cancelAnimationFrame(rafRef.current);
-      rafRef.current = null;
-    }
-
-    setMountedCount((prev) => {
-      if (prev >= diffItems.length) return diffItems.length;
-      return prev;
-    });
-
-    let cancelled = false;
-    function mountNextBatch() {
-      if (cancelled) return;
-      setMountedCount((prev) => {
-        const next = Math.min(prev + MOUNT_BATCH_SIZE, diffItems.length);
-        if (next < diffItems.length) {
-          rafRef.current = requestAnimationFrame(mountNextBatch);
-        } else {
-          rafRef.current = null;
-        }
-        return next;
-      });
-    }
-
-    rafRef.current = requestAnimationFrame(mountNextBatch);
-
-    return () => {
-      cancelled = true;
-      if (rafRef.current !== null) {
-        cancelAnimationFrame(rafRef.current);
-        rafRef.current = null;
-      }
-    };
-  }, [diffItems]);
-
-  const virtualizerRef = useRef<{
-    scrollFileToTop: (el: HTMLElement) => Promise<void>;
-  } | null>(null);
-  const topBandCandidatesRef = useRef<Set<HTMLElement>>(new Set());
-  const latestScrollRequestRef = useRef<number | null>(null);
-
-  const itemsToRender =
-    mountedCount >= diffItems.length
-      ? diffItems
-      : diffItems.slice(0, mountedCount);
-
-  const orderedPaths = useMemo(
-    () => diffItems.map(({ diff }) => diff.newPath || diff.oldPath || ''),
-    [diffItems]
-  );
-
-  const pathToIndex = useMemo(
-    () => new Map(orderedPaths.map((p, i) => [p, i])),
-    [orderedPaths]
-  );
-
-  const indexToPath = useCallback(
-    (index: number) => orderedPaths[index] ?? null,
-    [orderedPaths]
-  );
-
-  const handleFileInViewChanged = useCallback((path: string | null) => {
-    useFileInViewStore.getState().setFileInView(path);
-  }, []);
-
-  const {
-    scrollToFile: beginProgrammaticScroll,
-    onRangeChanged: updateFileInViewFromRange,
-    onScrollComplete,
-  } = useScrollSyncStateMachine({
-    pathToIndex,
-    indexToPath,
-    onFileInViewChanged: handleFileInViewChanged,
-  });
-
-  const pathToIndexRef = useRef(pathToIndex);
-  pathToIndexRef.current = pathToIndex;
-  const updateFIVRef = useRef(updateFileInViewFromRange);
-  updateFIVRef.current = updateFileInViewFromRange;
-
-  const hasItems = itemsToRender.length > 0;
-
-  useEffect(() => {
-    if (!hasItems) return;
-
-    const firstWrapper = document.querySelector('[data-diff-path]');
-    const scrollRoot =
-      firstWrapper instanceof HTMLElement
-        ? firstWrapper.closest('.overflow-auto')
-        : null;
-
-    if (!(scrollRoot instanceof HTMLElement)) return;
-
-    topBandCandidatesRef.current.clear();
-
-    const intersectionObs = new IntersectionObserver(
-      (entries) => {
-        for (const entry of entries) {
-          if (!(entry.target instanceof HTMLElement)) continue;
-          if (!entry.target.isConnected) {
-            topBandCandidatesRef.current.delete(entry.target);
-            continue;
-          }
-          if (entry.isIntersecting) {
-            topBandCandidatesRef.current.add(entry.target);
-          } else {
-            topBandCandidatesRef.current.delete(entry.target);
-          }
-        }
-
-        let topPath: string | null = null;
-        let minDist = Infinity;
-        const rootTop = scrollRoot.getBoundingClientRect().top;
-
-        for (const el of topBandCandidatesRef.current) {
-          if (!el.isConnected) {
-            topBandCandidatesRef.current.delete(el);
-            continue;
-          }
-          const dist = Math.abs(el.getBoundingClientRect().top - rootTop);
-          if (dist < minDist) {
-            minDist = dist;
-            topPath = el.dataset.diffPath ?? null;
-          }
-        }
-
-        if (topPath) {
-          const idx = pathToIndexRef.current.get(topPath);
-          if (idx !== undefined) {
-            updateFIVRef.current({ startIndex: idx, endIndex: idx });
-          }
-        }
+  const options = useMemo<
+    CodeViewReactOptions<ExtendedCommentAnnotation, undefined>
+  >(
+    () => ({
+      diffStyle:
+        globalMode === 'split' ? ('split' as const) : ('unified' as const),
+      diffIndicators: 'classic' as const,
+      themeType: actualTheme,
+      overflow: wrapText ? ('wrap' as const) : ('scroll' as const),
+      hunkSeparators: 'line-info' as const,
+      stickyHeaders: true,
+      layout: CODE_VIEW_LAYOUT,
+      enableGutterUtility: true,
+      theme: { dark: 'github-dark', light: 'github-light' } as const,
+      unsafeCSS: PIERRE_DIFFS_THEME_CSS,
+      ...(metrics ? { itemMetrics: metrics } : {}),
+      onLineClick: (
+        props: { lineNumber: number; annotationSide?: AnnotationSide },
+        context: { item: { id: string } }
+      ) => {
+        handleLineClick(
+          context.item.id,
+          props.lineNumber,
+          props.annotationSide ?? 'additions'
+        );
       },
-      {
-        root: scrollRoot,
-        rootMargin: '0px 0px -90% 0px',
-        threshold: 0,
-      }
-    );
+    }),
+    [globalMode, actualTheme, wrapText, metrics, handleLineClick]
+  );
 
-    scrollRoot
-      .querySelectorAll<HTMLElement>('[data-diff-path]')
-      .forEach((el) => intersectionObs.observe(el));
+  const hasItems = items.length > 0;
 
-    const mutationObs = new MutationObserver((mutations) => {
-      for (const mutation of mutations) {
-        for (const node of mutation.addedNodes) {
-          if (!(node instanceof HTMLElement)) continue;
-          if (node.dataset.diffPath !== undefined) {
-            intersectionObs.observe(node);
-          }
-          node
-            .querySelectorAll<HTMLElement>('[data-diff-path]')
-            .forEach((child) => intersectionObs.observe(child));
-        }
-      }
-    });
-    mutationObs.observe(scrollRoot, { childList: true, subtree: true });
-
-    return () => {
-      topBandCandidatesRef.current.clear();
-      intersectionObs.disconnect();
-      mutationObs.disconnect();
-    };
-  }, [hasItems]);
-
-  // Measure real line/header geometry once a diff has rendered, then feed it to
-  // the virtualizer via `metrics`. Pierre skips DOM measurement in our default
-  // (no-wrap) mode and trusts its built-in size estimates; when those don't
-  // match our themed CSS the scroll-anchor correction fights the user and the
-  // scroll snaps back. Measuring once keeps the fast path but with real numbers.
+  // Measure real line/header geometry once a diff has rendered, then feed it
+  // back as `itemMetrics`. Pierre estimates unrendered items from built-in
+  // sizes; when those disagree with our themed CSS the scrollbar jitters as
+  // estimates get replaced by measurements.
   useEffect(() => {
     if (metrics !== null || !hasItems) return;
     let raf = 0;
@@ -882,11 +757,7 @@ export const ChangesPanelContainer = memo(function ChangesPanelContainer({
 
     const tryMeasure = () => {
       if (settled) return;
-      const firstWrapper = document.querySelector('[data-diff-path]');
-      const scrollRoot =
-        firstWrapper instanceof HTMLElement
-          ? firstWrapper.closest('.overflow-auto')
-          : null;
+      const scrollRoot = scrollRootRef.current;
       const measured =
         scrollRoot instanceof HTMLElement
           ? measureDiffMetrics(scrollRoot)
@@ -913,10 +784,9 @@ export const ChangesPanelContainer = memo(function ChangesPanelContainer({
 
     startMeasuring();
 
-    // If every initially-rendered file is auto-collapsed (e.g. deleted/renamed
-    // or large diffs) there is no code line to measure and the retry window
-    // expires on defaults. Expanding a file only updates the store, which does
-    // not re-run this effect, so subscribe and re-measure once a file expands.
+    // If every initially-rendered file is collapsed (deleted/renamed or large
+    // diffs) there is no code line to measure and the retry window expires on
+    // defaults. Expanding a file only updates the store, so re-measure then.
     const unsubscribe = useUiPreferencesStore.subscribe((state, prev) => {
       if (settled || state.expanded === prev.expanded) return;
       startMeasuring();
@@ -929,59 +799,106 @@ export const ChangesPanelContainer = memo(function ChangesPanelContainer({
     };
   }, [metrics, hasItems]);
 
+  // Track the file at the top of the viewport for the file tree's selection.
+  const handleScroll = useCallback(
+    (
+      scrollTop: number,
+      viewer: { getTopForItem(id: string): number | undefined }
+    ) => {
+      const paths = orderedPathsRef.current;
+      if (paths.length === 0) return;
+
+      // Binary search for the last item starting at or above the viewport top.
+      const probe = scrollTop + 1;
+      let low = 0;
+      let high = paths.length - 1;
+      let found = paths[0];
+      while (low <= high) {
+        const mid = (low + high) >> 1;
+        const top = viewer.getTopForItem(paths[mid]);
+        if (top === undefined) break;
+        if (top <= probe) {
+          found = paths[mid];
+          low = mid + 1;
+        } else {
+          high = mid - 1;
+        }
+      }
+      useFileInViewStore.getState().setFileInView(found);
+    },
+    []
+  );
+
+  // CodeView only reports the file in view once the user scrolls, so seed it
+  // with the first file when the list arrives — the file tree highlights it
+  // from the moment the panel opens, as it did under the old observer.
+  const seededFileInViewRef = useRef(false);
+  useEffect(() => {
+    if (seededFileInViewRef.current || items.length === 0) return;
+    seededFileInViewRef.current = true;
+    useFileInViewStore.getState().setFileInView(items[0].id);
+  }, [items]);
+
+  // Scroll-to-file has to run after the item list reflects an expand, so the
+  // request is queued and flushed once the new items are committed.
+  const pendingScrollRef = useRef<{
+    path: string;
+    lineNumber?: number;
+    requestedAt: number;
+  } | null>(null);
+  const [scrollRequestId, setScrollRequestId] = useState(0);
+
   const handleScrollToFile = useCallback(
     (path: string, lineNumber?: number) => {
-      const expandKey = `diff:${path}`;
-      const expandedState = useUiPreferencesStore.getState().expanded;
-      if (!(expandedState[expandKey] ?? false)) {
-        useUiPreferencesStore.getState().setExpanded(expandKey, true);
-      }
-
-      if (rafRef.current !== null) {
-        cancelAnimationFrame(rafRef.current);
-        rafRef.current = null;
-        setMountedCount(diffItems.length);
-      }
-
-      const requestId = beginProgrammaticScroll(path, lineNumber);
-      if (requestId === null) return;
-      latestScrollRequestRef.current = requestId;
-
-      requestAnimationFrame(() => {
-        const wrapper = document.querySelector(
-          `[data-diff-path="${CSS.escape(path)}"]`
-        );
-        if (!(wrapper instanceof HTMLElement)) {
-          onScrollComplete(requestId);
-          return;
-        }
-
-        const fileContainer = wrapper.querySelector('diffs-container');
-        if (!(fileContainer instanceof HTMLElement)) {
-          onScrollComplete(requestId);
-          return;
-        }
-
-        const virtualizer = virtualizerRef.current;
-        if (!virtualizer) {
-          onScrollComplete(requestId);
-          return;
-        }
-
-        void virtualizer
-          .scrollFileToTop(fileContainer)
-          .then(() => {
-            if (lineNumber && latestScrollRequestRef.current === requestId) {
-              scrollToLineInDiff(wrapper, lineNumber);
-            }
-          })
-          .finally(() => {
-            requestAnimationFrame(() => onScrollComplete(requestId));
-          });
-      });
+      const key = expandKeyFor(path);
+      const prefs = useUiPreferencesStore.getState();
+      const isCollapsed =
+        prefs.expanded[key] === undefined
+          ? (defaultCollapsedRef.current.get(path) ?? false)
+          : !prefs.expanded[key];
+      if (isCollapsed) prefs.setExpanded(key, true);
+      useFileInViewStore.getState().setFileInView(path);
+      pendingScrollRef.current = { path, lineNumber, requestedAt: Date.now() };
+      setScrollRequestId((id) => id + 1);
     },
-    [diffItems.length, beginProgrammaticScroll, onScrollComplete]
+    []
   );
+
+  useEffect(() => {
+    const pending = pendingScrollRef.current;
+    if (!pending) return;
+    // A request outlives a render or two on purpose: the file may still be
+    // streaming in, or an expand may not have committed yet. It does not
+    // outlive the user's interest in it.
+    if (Date.now() - pending.requestedAt > PENDING_SCROLL_TTL_MS) {
+      pendingScrollRef.current = null;
+      return;
+    }
+    const handle = codeViewRef.current;
+    if (!handle) return;
+    const item = handle.getItem(pending.path);
+    if (!item) return;
+    // A line inside a collapsed file resolves to the header, which would burn
+    // the request on a half-done scroll; wait for the expand to land.
+    if (pending.lineNumber != null && item.collapsed) return;
+
+    pendingScrollRef.current = null;
+    // Always land on the file first: CodeView ignores a line target it cannot
+    // resolve (a deleted-file line requested on the additions side, a line
+    // outside the rendered hunks), and without this the panel would not move
+    // at all for those requests.
+    handle.scrollTo({ type: 'item', id: pending.path, align: 'start' });
+    if (pending.lineNumber != null) {
+      const change = diffByPathRef.current.get(pending.path)?.change;
+      handle.scrollTo({
+        type: 'line',
+        id: pending.path,
+        lineNumber: pending.lineNumber,
+        ...(change === 'deleted' ? { side: 'deletions' as const } : {}),
+        align: 'start',
+      });
+    }
+  }, [items, scrollRequestId]);
 
   useEffect(() => {
     registerScrollToFile(handleScrollToFile);
@@ -995,27 +912,18 @@ export const ChangesPanelContainer = memo(function ChangesPanelContainer({
       poolOptions={POOL_OPTIONS}
       highlighterOptions={HIGHLIGHTER_OPTIONS}
     >
-      <Virtualizer
-        {...({ ref: virtualizerRef } as Record<string, unknown>)}
-        className={`w-full h-full overflow-auto bg-secondary px-base pt-1 ${className}`}
-        contentClassName="flex flex-col gap-1"
-        style={{ contain: 'layout style paint' }}
-      >
-        {itemsToRender.map(({ diff, initialExpanded }) => {
-          const path = diff.newPath || diff.oldPath || '';
-          return (
-            <DiffFileItem
-              // Key flips once when measured metrics arrive, remounting each
-              // FileDiff so it picks up the metrics (read only at construction).
-              key={metrics ? `${path} measured` : path}
-              diff={diff}
-              initialExpanded={initialExpanded}
-              workspaceId={workspaceId}
-              metrics={metrics ?? undefined}
-            />
-          );
-        })}
-      </Virtualizer>
+      <CodeView<ExtendedCommentAnnotation>
+        ref={codeViewRef}
+        containerRef={scrollRootRef}
+        items={items}
+        options={options}
+        onScroll={handleScroll}
+        renderHeaderPrefix={renderHeaderPrefix}
+        renderHeaderMetadata={renderHeaderMetadata}
+        renderAnnotation={renderAnnotation}
+        renderGutterUtility={renderGutterUtility}
+        className={`w-full h-full overflow-auto bg-secondary px-base ${className}`}
+      />
     </WorkerPoolContextProvider>
   );
 });
