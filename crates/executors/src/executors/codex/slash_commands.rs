@@ -272,10 +272,12 @@ impl Codex {
                     phase: None,
                     memory_citation: None,
                     delivery: None,
+                    questions: None,
                 }),
                 Err(message) => EventMsg::Error(ErrorEvent {
                     message,
                     codex_error_info: None,
+                    misalignment: None,
                 }),
             }],
         )
@@ -337,6 +339,7 @@ pub async fn log_event_raw(log_writer: &LogWriter, message: String) -> Result<()
             phase: None,
             memory_citation: None,
             delivery: None,
+            questions: None,
         }),
     )
     .await

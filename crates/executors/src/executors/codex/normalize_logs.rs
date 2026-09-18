@@ -1309,6 +1309,20 @@ fn handle_direct_notification(
             add_thread_token_usage(notification, msg_store, entry_index);
             true
         }
+        ServerNotification::AuthRecoveryStarted(notification)
+        | ServerNotification::AuthRecoveryCompleted(notification) => {
+            add_normalized_entry(
+                msg_store,
+                entry_index,
+                NormalizedEntry {
+                    timestamp: None,
+                    entry_type: NormalizedEntryType::SystemMessage,
+                    content: format!("{}: {}", notification.provider, notification.message),
+                    metadata: None,
+                },
+            );
+            true
+        }
         ServerNotification::AgentMessageDelta(notification) => {
             state.thinking = None;
             let (entry, index, is_new) = state.assistant_message_append(notification.delta);
@@ -2210,6 +2224,8 @@ pub fn normalize_logs(
                 EventMsg::Error(ErrorEvent {
                     message,
                     codex_error_info,
+                    // Never deserialized from the wire: the field is `serde(skip)`.
+                    misalignment: _,
                 }) => {
                     add_normalized_entry(
                         &msg_store,
@@ -2415,7 +2431,11 @@ pub fn normalize_logs(
                 | EventMsg::EnvironmentConnected(..)
                 | EventMsg::EnvironmentDisconnected(..)
                 | EventMsg::RawResponseCompleted(..)
-                | EventMsg::ThreadQueueChanged(..) => {}
+                | EventMsg::ThreadQueueChanged(..)
+                // Surfaced through the `modelProvider/authRecovery*`
+                // notifications instead, which is what the app server sends.
+                | EventMsg::AuthRecoveryStarted(..)
+                | EventMsg::AuthRecoveryCompleted(..) => {}
             }
         }
     });

@@ -52,16 +52,21 @@
       ]
     },
     "model_reasoning_effort": {
-      "description": "Reasoning effort for the underlying model",
+      "description": "Reasoning effort for the underlying model.\n\nMirrors the efforts Codex names in its model catalog, so any effort a model\nadvertises can be selected and written back as a config override.",
       "type": [
         "string",
         "null"
       ],
       "enum": [
+        "none",
+        "minimal",
         "low",
         "medium",
         "high",
         "xhigh",
+        "max",
+        "ultra",
+        "persistent",
         null
       ]
     },

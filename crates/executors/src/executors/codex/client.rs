@@ -17,12 +17,13 @@ use codex_app_server_protocol::{
     FileChangeRequestApprovalResponse, GetAccountParams, GetAccountRateLimitsResponse,
     GetAccountResponse, InitializeCapabilities, InitializeParams, InitializeResponse,
     ItemCompletedNotification, JSONRPCError, JSONRPCNotification, JSONRPCRequest, JSONRPCResponse,
-    ListMcpServerStatusParams, ListMcpServerStatusResponse, McpServerStatusDetail, RequestId,
-    ReviewStartParams, ReviewStartResponse, ReviewTarget, ServerRequest, ThreadCompactStartParams,
-    ThreadCompactStartResponse, ThreadForkParams, ThreadForkResponse, ThreadItem, ThreadReadParams,
-    ThreadReadResponse, ThreadStartParams, ThreadStartResponse, ToolRequestUserInputAnswer,
-    ToolRequestUserInputQuestion, ToolRequestUserInputResponse, TurnCompletedNotification,
-    TurnStartParams, TurnStartResponse, TurnStatus, UserInput,
+    ListMcpServerStatusParams, ListMcpServerStatusResponse, McpServerStatusDetail, ModelListParams,
+    ModelListResponse, RequestId, ReviewStartParams, ReviewStartResponse, ReviewTarget,
+    ServerRequest, ThreadCompactStartParams, ThreadCompactStartResponse, ThreadForkParams,
+    ThreadForkResponse, ThreadItem, ThreadReadParams, ThreadReadResponse, ThreadStartParams,
+    ThreadStartResponse, ToolRequestUserInputAnswer, ToolRequestUserInputQuestion,
+    ToolRequestUserInputResponse, TurnCompletedNotification, TurnStartParams, TurnStartResponse,
+    TurnStatus, UserInput,
 };
 use codex_protocol::config_types::{CollaborationMode, ModeKind, Settings};
 use futures::TryFutureExt;
@@ -291,6 +292,26 @@ impl AppServerClient {
             },
         };
         self.send_request(request, "config/read").await
+    }
+
+    /// Fetch one page of the model catalog the installed Codex offers.
+    ///
+    /// Hidden models are included: they are not for the picker, but a config
+    /// can name one, and then its metadata is the only description of the model
+    /// a session would run.
+    pub async fn model_list(
+        &self,
+        cursor: Option<String>,
+    ) -> Result<ModelListResponse, ExecutorError> {
+        let request = ClientRequest::ModelList {
+            request_id: self.next_request_id(),
+            params: ModelListParams {
+                cursor,
+                limit: None,
+                include_hidden: Some(true),
+            },
+        };
+        self.send_request(request, "model/list").await
     }
 
     pub async fn get_account_rate_limits(
@@ -989,7 +1010,8 @@ fn request_id(request: &ClientRequest) -> RequestId {
         | ClientRequest::ThreadRead { request_id, .. }
         | ClientRequest::ConfigRead { request_id, .. }
         | ClientRequest::ConfigBatchWrite { request_id, .. }
-        | ClientRequest::GetAccountRateLimits { request_id, .. } => request_id.clone(),
+        | ClientRequest::GetAccountRateLimits { request_id, .. }
+        | ClientRequest::ModelList { request_id, .. } => request_id.clone(),
         _ => unreachable!("request_id called for unsupported request variant"),
     }
 }

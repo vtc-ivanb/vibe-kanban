@@ -75,7 +75,7 @@ pub struct Grok {
 
 impl Grok {
     fn build_command_builder(&self) -> Result<CommandBuilder, CommandBuildError> {
-        let mut builder = CommandBuilder::new("npx -y @xai-official/grok@1.0.5 agent");
+        let mut builder = CommandBuilder::new("npx -y @xai-official/grok@1.0.34 agent");
 
         if let Some(model) = &self.model {
             builder = builder.extend_params(["-m", model.as_str()]);
@@ -342,7 +342,7 @@ mod tests {
     fn builds_acp_stdio_command_by_default() {
         let builder = grok().build_command_builder().unwrap();
 
-        assert_eq!(builder.base, "npx -y @xai-official/grok@1.0.5 agent");
+        assert_eq!(builder.base, "npx -y @xai-official/grok@1.0.34 agent");
         assert_eq!(builder.params, Some(vec!["stdio".to_string()]));
     }
 

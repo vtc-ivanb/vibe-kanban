@@ -90,11 +90,14 @@ impl ReasoningOption {
     ) -> Vec<ReasoningOption> {
         let rank_key = |id: &str| match id.to_lowercase().as_str() {
             "none" => Some(0),
-            "low" => Some(1),
-            "medium" => Some(2),
-            "high" => Some(3),
-            "xhigh" => Some(4),
-            "max" => Some(5),
+            "minimal" => Some(1),
+            "low" => Some(2),
+            "medium" => Some(3),
+            "high" => Some(4),
+            "xhigh" => Some(5),
+            "max" => Some(6),
+            "ultra" => Some(7),
+            "persistent" => Some(8),
             _ => None,
         };
 
