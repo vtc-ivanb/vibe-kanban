@@ -1,4 +1,7 @@
-use std::{path::Path, str::FromStr};
+use std::{
+    path::{Path, PathBuf},
+    str::FromStr,
+};
 
 use executors::{command::CommandBuilder, executors::ExecutorError};
 use serde::{Deserialize, Serialize};
@@ -120,18 +123,45 @@ impl EditorConfig {
                     editor_type: self.editor_type.clone(),
                 })?;
 
-        let (executable, args) = command_parts.into_resolved().await.map_err(|e| match e {
-            ExecutorError::ExecutableNotFound { program } => EditorOpenError::ExecutableNotFound {
-                executable: program,
-                editor_type: self.editor_type.clone(),
-            },
-            _ => EditorOpenError::InvalidCommand {
+        match command_parts.into_resolved().await {
+            Ok(resolved) => Ok(resolved),
+            Err(ExecutorError::ExecutableNotFound { program }) => {
+                // Some editors don't put their CLI on PATH at install time
+                // (Zed requires running "Install CLI" first), so fall back to
+                // the CLI shipped inside the app bundle.
+                if let Some(bundled) = self
+                    .bundled_cli_candidates()
+                    .into_iter()
+                    .find(|p| p.is_file())
+                {
+                    return Ok((bundled, Vec::new()));
+                }
+                Err(EditorOpenError::ExecutableNotFound {
+                    executable: program,
+                    editor_type: self.editor_type.clone(),
+                })
+            }
+            Err(e) => Err(EditorOpenError::InvalidCommand {
                 details: e.to_string(),
                 editor_type: self.editor_type.clone(),
-            },
-        })?;
+            }),
+        }
+    }
 
-        Ok((executable, args))
+    /// Known locations of the editor's CLI inside its macOS app bundle.
+    fn bundled_cli_candidates(&self) -> Vec<PathBuf> {
+        if !cfg!(target_os = "macos") {
+            return Vec::new();
+        }
+        let relative = match self.editor_type {
+            EditorType::Zed => "Zed.app/Contents/MacOS/cli",
+            _ => return Vec::new(),
+        };
+        let mut roots = vec![PathBuf::from("/Applications")];
+        if let Some(home) = dirs::home_dir() {
+            roots.push(home.join("Applications"));
+        }
+        roots.into_iter().map(|root| root.join(relative)).collect()
     }
 
     /// Check if the editor is available on the system.
@@ -230,5 +260,30 @@ impl EditorConfig {
         } else {
             self.clone()
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn zed_falls_back_to_bundled_cli_on_macos() {
+        let config = EditorConfig::new(EditorType::Zed, None, None, None, true);
+        let candidates = config.bundled_cli_candidates();
+        if cfg!(target_os = "macos") {
+            assert_eq!(
+                candidates.first(),
+                Some(&PathBuf::from("/Applications/Zed.app/Contents/MacOS/cli"))
+            );
+        } else {
+            assert!(candidates.is_empty());
+        }
+    }
+
+    #[test]
+    fn editors_on_path_have_no_bundled_fallback() {
+        let config = EditorConfig::new(EditorType::VsCode, None, None, None, true);
+        assert!(config.bundled_cli_candidates().is_empty());
     }
 }
