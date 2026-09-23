@@ -47,6 +47,49 @@ pub(crate) async fn create_workspace_record(
     Ok(workspace)
 }
 
+/// Deletes the workspace record it guards unless it is disarmed first.
+///
+/// `create_and_start_workspace` inserts the workspace row before attaching
+/// repositories, so a failure — or a client that hangs up mid-request, which
+/// makes axum drop the handler future without ever returning an error — used to
+/// leave behind a repo-less workspace that the UI could neither open nor delete.
+struct WorkspaceRecordGuard {
+    workspace_id: Option<Uuid>,
+    pool: sqlx::SqlitePool,
+}
+
+impl WorkspaceRecordGuard {
+    fn new(workspace_id: Uuid, pool: sqlx::SqlitePool) -> Self {
+        Self {
+            workspace_id: Some(workspace_id),
+            pool,
+        }
+    }
+
+    fn disarm(&mut self) {
+        self.workspace_id = None;
+    }
+}
+
+impl Drop for WorkspaceRecordGuard {
+    fn drop(&mut self) {
+        let Some(workspace_id) = self.workspace_id.take() else {
+            return;
+        };
+        let pool = self.pool.clone();
+        tokio::spawn(async move {
+            match Workspace::delete(&pool, workspace_id).await {
+                Ok(_) => tracing::warn!("Rolled back partially created workspace {}", workspace_id),
+                Err(e) => tracing::error!(
+                    "Failed to roll back partially created workspace {}: {}",
+                    workspace_id,
+                    e
+                ),
+            }
+        });
+    }
+}
+
 pub async fn create_workspace(
     State(deployment): State<DeploymentImpl>,
     Json(payload): Json<CreateWorkspaceApiRequest>,
@@ -234,9 +277,15 @@ pub async fn create_and_start_workspace(
         ));
     }
 
+    let workspace_record = create_workspace_record(&deployment, name).await?;
+    // Armed until the repositories are attached: anything that unwinds before
+    // then must not leave the record behind.
+    let mut record_guard =
+        WorkspaceRecordGuard::new(workspace_record.id, deployment.db().pool.clone());
+
     let mut managed_workspace = deployment
         .workspace_manager()
-        .load_managed_workspace(create_workspace_record(&deployment, name).await?)
+        .load_managed_workspace(workspace_record)
         .await?;
 
     for repo in &repos {
@@ -245,6 +294,8 @@ pub async fn create_and_start_workspace(
             .await
             .map_err(ApiError::from)?;
     }
+
+    record_guard.disarm();
 
     if let Some(ids) = &attachment_ids {
         managed_workspace.associate_attachments(ids).await?;
@@ -325,7 +376,63 @@ mod tests {
     use db::models::file::File;
     use uuid::Uuid;
 
-    use super::{ImportedIssueAttachment, rewrite_imported_issue_attachments_markdown};
+    use super::{
+        ImportedIssueAttachment, WorkspaceRecordGuard, rewrite_imported_issue_attachments_markdown,
+    };
+
+    /// Minimal `workspaces` table holding a single row, enough for
+    /// [`Workspace::delete`]'s `DELETE FROM workspaces WHERE id = $1`.
+    async fn pool_with_workspace(workspace_id: Uuid) -> sqlx::SqlitePool {
+        let pool = sqlx::SqlitePool::connect("sqlite::memory:").await.unwrap();
+        sqlx::query("CREATE TABLE workspaces (id BLOB PRIMARY KEY, branch TEXT NOT NULL)")
+            .execute(&pool)
+            .await
+            .unwrap();
+        sqlx::query("INSERT INTO workspaces (id, branch) VALUES (?, 'vk/test')")
+            .bind(workspace_id)
+            .execute(&pool)
+            .await
+            .unwrap();
+        pool
+    }
+
+    async fn workspace_count(pool: &sqlx::SqlitePool, workspace_id: Uuid) -> i64 {
+        sqlx::query_scalar::<_, i64>("SELECT COUNT(*) FROM workspaces WHERE id = ?")
+            .bind(workspace_id)
+            .fetch_one(pool)
+            .await
+            .unwrap()
+    }
+
+    #[tokio::test]
+    async fn armed_guard_deletes_the_workspace_record_on_drop() {
+        let workspace_id = Uuid::new_v4();
+        let pool = pool_with_workspace(workspace_id).await;
+
+        drop(WorkspaceRecordGuard::new(workspace_id, pool.clone()));
+
+        // Drop spawns the delete, so give the runtime a chance to run it.
+        for _ in 0..50 {
+            if workspace_count(&pool, workspace_id).await == 0 {
+                return;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+        }
+        panic!("guard did not delete the workspace record");
+    }
+
+    #[tokio::test]
+    async fn disarmed_guard_keeps_the_workspace_record() {
+        let workspace_id = Uuid::new_v4();
+        let pool = pool_with_workspace(workspace_id).await;
+
+        let mut guard = WorkspaceRecordGuard::new(workspace_id, pool.clone());
+        guard.disarm();
+        drop(guard);
+
+        tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+        assert_eq!(workspace_count(&pool, workspace_id).await, 1);
+    }
 
     fn imported_file(
         attachment_id: Uuid,

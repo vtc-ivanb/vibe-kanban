@@ -297,12 +297,21 @@ export const Actions = {
       const linkedIssueSimpleId = remoteWs?.issue_id
         ? ctx.projectMutations?.getIssue(remoteWs.issue_id)?.simple_id
         : undefined;
-      const branchStatus = await workspacesApi.getBranchStatus(workspaceId);
-      const hasOpenPR = branchStatus.some((repoStatus) =>
-        repoStatus.merges?.some(
-          (m: Merge) => m.type === 'pr' && m.pr_info.status === 'open'
-        )
-      );
+      // Branch status is only used to disable the "delete branch" checkbox.
+      // A broken workspace (e.g. one created without repos) makes this fail,
+      // and deletion is exactly what you want in that case — so never let it
+      // block the dialog.
+      let hasOpenPR = false;
+      try {
+        const branchStatus = await workspacesApi.getBranchStatus(workspaceId);
+        hasOpenPR = branchStatus.some((repoStatus) =>
+          repoStatus.merges?.some(
+            (m: Merge) => m.type === 'pr' && m.pr_info.status === 'open'
+          )
+        );
+      } catch {
+        hasOpenPR = false;
+      }
 
       const result = await DeleteWorkspaceDialog.show({
         branchName: workspace.branch,

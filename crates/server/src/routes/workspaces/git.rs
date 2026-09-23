@@ -574,6 +574,15 @@ pub async fn get_workspace_branch_status(
 
     let repositories = WorkspaceRepo::find_repos_for_workspace(pool, workspace.id).await?;
     let workspace_repos = WorkspaceRepo::find_by_workspace_id(pool, workspace.id).await?;
+
+    // A workspace with no repositories has no branch status to report. Return
+    // an empty list instead of erroring out of `ensure_container_exists`, so
+    // callers that only need the status opportunistically (the delete dialog,
+    // the workspace header) still work on a half-created workspace.
+    if repositories.is_empty() || workspace_repos.is_empty() {
+        return Ok(ResponseJson(ApiResponse::success(Vec::new())));
+    }
+
     let target_branches: HashMap<_, _> = workspace_repos
         .iter()
         .map(|wr| (wr.repo_id, wr.target_branch.clone()))
