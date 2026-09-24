@@ -51,8 +51,14 @@ ts-rs = { git = "https://github.com/xazukx/ts-rs.git", branch = "use-ts-enum", f
 schemars = { version = "1.0.4", features = ["derive", "chrono04", "uuid1", "preserve_order"] }
 serde_with = "3"
 async-trait = "0.1"
-aws-lc-sys = "=0.37.0"
-aws-lc-rs = "=1.16.0"
+# These were pinned exactly because the aws-lc-sys releases of the time broke
+# the cargo-xwin clang-cl cross-compile the Windows builds use. Upstream has
+# since keyed its C flag dialect on the compiler driver mode rather than the
+# target ABI (aws/aws-lc-rs#1146), and these versions were checked against that
+# cross-compile. Left as a floor rather than dropped so the versions known to
+# build stay written down.
+aws-lc-sys = "0.45.0"
+aws-lc-rs = "1.18.1"
 
 # codex-otel (pulled in via codex-app-server-protocol) needs the `proxy` feature,
 # which only exists on OpenAI's forks. Mirrors the patches in openai/codex's

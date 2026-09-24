@@ -720,6 +720,18 @@ fn fallback_models() -> Vec<ModelInfo> {
             Medium,
         ),
         (
+            "gpt-6-sol",
+            "GPT-6-Sol",
+            &[Low, Medium, High, Xhigh, Max, Ultra][..],
+            Medium,
+        ),
+        (
+            "gpt-6-luna",
+            "GPT-6-Luna",
+            &[Low, Medium, High, Xhigh, Max][..],
+            Medium,
+        ),
+        (
             "gpt-5.6-sol",
             "GPT-5.6-Sol",
             &[Low, Medium, High, Xhigh, Max, Ultra][..],
@@ -823,7 +835,7 @@ fn default_discovered_options() -> ExecutorDiscoveredOptions {
 
 impl Codex {
     pub fn base_command() -> &'static str {
-        "npx -y @openai/codex@0.154.0"
+        "npx -y @openai/codex@0.156.1"
     }
 
     fn build_command_builder(&self) -> Result<CommandBuilder, CommandBuildError> {
