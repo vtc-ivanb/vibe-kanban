@@ -165,6 +165,18 @@ The profiles configuration uses a JSON structure with an `executors` object cont
   [View full documentation →](https://qwenlm.github.io/qwen-code-docs/en/cli/index)
 </Tab>
 
+<Tab title="KIMI_CODE">
+  <ParamField path="model" type="string">
+  Select a model alias from your Kimi Code configuration.
+  </ParamField>
+
+  <ParamField path="yolo" type="boolean">
+  Approve tools automatically. Set to `false` to require approval through Vibe Kanban.
+  </ParamField>
+
+  [Kimi Code setup guide](/agents/kimi-code)
+</Tab>
+
 <Tab title="DROID">
   <ParamField path="autonomy" type="string">
   Permission level: `"normal"`, `"low"`, `"medium"`, `"high"`, or `"skip-permissions-unsafe"`

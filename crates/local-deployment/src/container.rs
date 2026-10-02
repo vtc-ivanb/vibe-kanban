@@ -1741,6 +1741,7 @@ impl ContainerService for LocalContainerService {
                     | BaseCodingAgent::ClaudeCode
                     | BaseCodingAgent::Gemini
                     | BaseCodingAgent::QwenCode
+                    | BaseCodingAgent::KimiCode
                     | BaseCodingAgent::Grok
                     | BaseCodingAgent::Opencode,
                 ) => ExecutorApprovalBridge::new(

@@ -331,9 +331,13 @@ impl AcpAgentHarness {
                         });
 
                         // Initialize
-                        let _ = conn
+                        if let Err(e) = conn
                             .initialize(proto::InitializeRequest::new(proto::ProtocolVersion::V1))
-                            .await;
+                            .await
+                        {
+                            report_startup_failure(&log_tx, &mut exit_signal_tx, "initialize", &e);
+                            return;
+                        }
 
                         // Handle session creation/forking
                         let (acp_session_id, display_session_id, prompt_to_send) =
@@ -360,7 +364,12 @@ impl AcpAgentHarness {
                                         (resp.session_id.0.to_string(), new_ui_id, resume_prompt)
                                     }
                                     Err(e) => {
-                                        error!("Failed to create session: {}", e);
+                                        report_startup_failure(
+                                            &log_tx,
+                                            &mut exit_signal_tx,
+                                            "create session",
+                                            &e,
+                                        );
                                         return;
                                     }
                                 }
@@ -375,7 +384,12 @@ impl AcpAgentHarness {
                                         (sid.clone(), sid, prompt)
                                     }
                                     Err(e) => {
-                                        error!("Failed to create session: {}", e);
+                                        report_startup_failure(
+                                            &log_tx,
+                                            &mut exit_signal_tx,
+                                            "create session",
+                                            &e,
+                                        );
                                         return;
                                     }
                                 }
@@ -394,7 +408,7 @@ impl AcpAgentHarness {
                                 .await
                             {
                                 Ok(_) => {}
-                                Err(e) => error!("Failed to set session mode: {}", e),
+                                Err(e) => error!("Failed to set session model: {}", e),
                             }
                         }
 
@@ -541,5 +555,46 @@ impl AcpAgentHarness {
         });
 
         Ok(())
+    }
+}
+
+fn report_startup_failure(
+    log_tx: &mpsc::UnboundedSender<String>,
+    exit_signal: &mut Option<tokio::sync::oneshot::Sender<ExecutorExitResult>>,
+    operation: &str,
+    error: &proto::Error,
+) {
+    let message = format!("Failed to {operation}: {error}");
+    error!("{message}");
+    let _ = log_tx.send(AcpEvent::Error(message).to_string());
+    if let Some(tx) = exit_signal.take() {
+        let _ = tx.send(ExecutorExitResult::Failure);
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[tokio::test]
+    async fn startup_failures_are_visible_and_fail_the_execution() {
+        let (log_tx, mut log_rx) = mpsc::unbounded_channel();
+        let (exit_tx, exit_rx) = tokio::sync::oneshot::channel();
+        let mut exit_signal = Some(exit_tx);
+        report_startup_failure(
+            &log_tx,
+            &mut exit_signal,
+            "create session",
+            &proto::Error::invalid_request(),
+        );
+        assert!(matches!(
+            exit_rx.await.unwrap(),
+            ExecutorExitResult::Failure
+        ));
+        assert!(matches!(
+            log_rx.recv().await.unwrap().parse::<AcpEvent>().unwrap(),
+            AcpEvent::Error(message) if message.contains("Failed to create session")
+        ));
+        assert!(exit_signal.is_none());
     }
 }

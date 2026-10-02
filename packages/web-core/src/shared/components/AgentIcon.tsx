@@ -31,6 +31,8 @@ export function getAgentName(
       return 'Droid';
     case BaseCodingAgent.GROK:
       return 'Grok';
+    case BaseCodingAgent.KIMI_CODE:
+      return 'Kimi Code';
   }
 }
 
@@ -77,6 +79,9 @@ export function AgentIcon({ agent, className = 'h-4 w-4' }: AgentIconProps) {
       break;
     case BaseCodingAgent.GROK:
       iconPath = `/agents/grok${suffix}.svg`;
+      break;
+    case BaseCodingAgent.KIMI_CODE:
+      iconPath = `/agents/kimi${suffix}.svg`;
       break;
     default:
       return null;

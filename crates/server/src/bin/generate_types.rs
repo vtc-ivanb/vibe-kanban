@@ -228,6 +228,7 @@ fn generate_types_content() -> String {
         executors::executors::opencode::Opencode::decl(),
         executors::executors::qwen::QwenCode::decl(),
         executors::executors::grok::Grok::decl(),
+        executors::executors::kimi::KimiCode::decl(),
         executors::executors::droid::Droid::decl(),
         executors::executors::droid::Autonomy::decl(),
         executors::executors::droid::ReasoningEffortLevel::decl(),
@@ -359,6 +360,10 @@ fn generate_schemas() -> Result<HashMap<&'static str, String>, serde_json::Error
         (
             "grok",
             generate_json_schema::<executors::executors::grok::Grok>()?,
+        ),
+        (
+            "kimi_code",
+            generate_json_schema::<executors::executors::kimi::KimiCode>()?,
         ),
     ]);
     println!(

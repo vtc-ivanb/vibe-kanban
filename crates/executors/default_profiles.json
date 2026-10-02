@@ -64,6 +64,13 @@
         }
       }
     },
+    "KIMI_CODE": {
+      "DEFAULT": {
+        "KIMI_CODE": {
+          "yolo": true
+        }
+      }
+    },
     "GROK": {
       "DEFAULT": {
         "GROK": {
