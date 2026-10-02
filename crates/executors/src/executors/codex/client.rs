@@ -234,6 +234,7 @@ impl AppServerClient {
                 limit: None,
                 detail: Some(McpServerStatusDetail::ToolsAndAuthOnly),
                 thread_id,
+                server_name: None,
             },
         };
         self.send_request(request, "mcpServerStatus/list").await
