@@ -17,7 +17,7 @@ import {
 } from '@lexical/table';
 
 const TABLE_ROW_REG_EXP = /^(?:\|)(.+)(?:\|)\s?$/;
-const TABLE_ROW_DIVIDER_REG_EXP = /^(\| ?:?-+:? ?)+\|\s?$/;
+const TABLE_ROW_DIVIDER_REG_EXP = /^\|(\s*:?-+:?\s*\|)+\s*$/;
 
 function $createTableCell(textContent: string): TableCellNode {
   textContent = textContent.replace(/\\n/g, '\n');
@@ -27,12 +27,10 @@ function $createTableCell(textContent: string): TableCellNode {
 }
 
 function mapToTableCells(textContent: string): Array<TableCellNode> | null {
-  const cells = textContent
-    .split('|')
-    .map((c) => c.trim())
-    .filter((c) => c.length > 0);
+  // Keep empty cells so columns stay aligned
+  const cells = textContent.split('|').map((c) => c.trim());
 
-  if (cells.length === 0) return null;
+  if (cells.every((c) => c.length === 0)) return null;
   return cells.map($createTableCell);
 }
 
@@ -76,21 +74,34 @@ export const TABLE_TRANSFORMER: ElementTransformer = {
   },
 
   replace: (parentNode, _children, match) => {
-    // Handle header divider detection
-    const lineText = parentNode.getTextContent();
-    if (TABLE_ROW_DIVIDER_REG_EXP.test(lineText)) {
-      // Find previous sibling and mark as header
-      const prevSibling = parentNode.getPreviousSibling();
-      if ($isTableNode(prevSibling)) {
-        const firstRow = prevSibling.getFirstChild();
-        if ($isTableRowNode(firstRow)) {
-          firstRow.getChildren().forEach((cell) => {
-            if ($isTableCellNode(cell)) {
-              cell.setHeaderStyles(TableCellHeaderStates.ROW);
-            }
-          });
+    // Check if previous sibling is a table to merge into
+    const prevSibling = parentNode.getPreviousSibling();
+
+    // Handle header divider detection. The markdown importer strips the matched
+    // text from parentNode before calling replace, so test the match itself.
+    // Only a divider directly after the first row marks a header; elsewhere a
+    // row like `| - | - |` is regular data.
+    const headerRow = $isTableNode(prevSibling)
+      ? prevSibling.getFirstChild()
+      : null;
+    if (
+      TABLE_ROW_DIVIDER_REG_EXP.test(match[0]) &&
+      $isTableNode(prevSibling) &&
+      prevSibling.getChildrenSize() === 1 &&
+      $isTableRowNode(headerRow) &&
+      !headerRow
+        .getChildren()
+        .some(
+          (cell) =>
+            $isTableCellNode(cell) &&
+            cell.getHeaderStyles() !== TableCellHeaderStates.NO_STATUS
+        )
+    ) {
+      headerRow.getChildren().forEach((cell) => {
+        if ($isTableCellNode(cell)) {
+          cell.setHeaderStyles(TableCellHeaderStates.ROW);
         }
-      }
+      });
       parentNode.remove();
       return;
     }
@@ -99,11 +110,16 @@ export const TABLE_TRANSFORMER: ElementTransformer = {
     const cells = mapToTableCells(match[1]);
     if (!cells) return;
 
+    // Pad short rows so every row has as many cells as the first one
+    if ($isTableRowNode(headerRow)) {
+      while (cells.length < headerRow.getChildrenSize()) {
+        cells.push($createTableCell(''));
+      }
+    }
+
     const tableRow = $createTableRowNode();
     cells.forEach((cell) => tableRow.append(cell));
 
-    // Check if previous sibling is a table to merge into
-    const prevSibling = parentNode.getPreviousSibling();
     if ($isTableNode(prevSibling)) {
       prevSibling.append(tableRow);
       parentNode.remove();
