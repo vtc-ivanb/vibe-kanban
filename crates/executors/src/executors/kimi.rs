@@ -10,7 +10,7 @@ use futures::stream::BoxStream;
 use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
 use ts_rs::TS;
-use workspace_utils::{msg_store::MsgStore, shell::resolve_executable_path_blocking};
+use workspace_utils::msg_store::MsgStore;
 
 use crate::{
     approvals::ExecutorApprovalService,
@@ -47,7 +47,10 @@ impl KimiCode {
     fn build_command_builder(&self) -> Result<CommandBuilder, CommandBuildError> {
         // `kimi acp` accepts neither --model nor --yolo. Configure the session
         // over ACP so the same settings apply to initial and follow-up runs.
-        apply_overrides(CommandBuilder::new("kimi").params(["acp"]), &self.cmd)
+        apply_overrides(
+            CommandBuilder::new("npx -y @moonshot-ai/kimi-code@2.1.1").params(["acp"]),
+            &self.cmd,
+        )
     }
 
     fn harness(&self) -> AcpAgentHarness {
@@ -206,7 +209,7 @@ impl StandardCodingAgentExecutor for KimiCode {
         let config_found = self
             .home()
             .is_some_and(|home| home.join("config.toml").is_file());
-        if config_found || resolve_executable_path_blocking("kimi").is_some() {
+        if config_found {
             AvailabilityInfo::InstallationFound
         } else {
             AvailabilityInfo::NotFound
@@ -263,7 +266,7 @@ mod tests {
         agent.model = Some("kimi-code/kimi-for-coding".into());
         agent.yolo = Some(true);
         let builder = agent.build_command_builder().unwrap();
-        assert_eq!(builder.base, "kimi");
+        assert_eq!(builder.base, "npx -y @moonshot-ai/kimi-code@2.1.1");
         assert_eq!(builder.params.unwrap(), ["acp"]);
 
         agent.cmd.base_command_override = Some("/custom/bin/kimi".into());

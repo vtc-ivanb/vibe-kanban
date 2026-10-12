@@ -1824,22 +1824,17 @@ pub fn normalize_logs(
                 }
                 EventMsg::ExecCommandEnd(ExecCommandEndEvent {
                     call_id,
-                    turn_id: _,
-                    command: _,
-                    cwd: _,
-                    parsed_cmd: _,
-                    source: _,
-                    interaction_input: _,
-                    stdout: _,
-                    stderr: _,
-                    aggregated_output: _,
+                    aggregated_output,
                     exit_code,
-                    duration: _,
-                    formatted_output,
                     ..
                 }) => {
                     if let Some(mut command_state) = state.commands.remove(&call_id) {
-                        command_state.formatted_output = Some(formatted_output);
+                        // Codex 0.162 dropped `formatted_output`; `aggregated_output` is the
+                        // surviving "as seen by the model" text, matching the app-server path
+                        // above. An empty aggregate means nothing was captured, so leave it
+                        // unset and keep the streamed deltas.
+                        command_state.formatted_output =
+                            (!aggregated_output.is_empty()).then_some(aggregated_output);
                         command_state.exit_code = Some(exit_code);
                         command_state.awaiting_approval = false;
                         command_state.status = if exit_code == 0 {

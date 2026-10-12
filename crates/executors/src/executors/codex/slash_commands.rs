@@ -315,13 +315,6 @@ pub async fn log_event_notification(
     log_writer: &LogWriter,
     event: EventMsg,
 ) -> Result<(), ExecutorError> {
-    let event = match event {
-        EventMsg::SessionConfigured(mut configured) => {
-            configured.initial_messages = None;
-            EventMsg::SessionConfigured(configured)
-        }
-        other => other,
-    };
     let notification = JSONRPCNotification {
         method: "codex/event".to_string(),
         params: Some(json!({ "msg": event })),

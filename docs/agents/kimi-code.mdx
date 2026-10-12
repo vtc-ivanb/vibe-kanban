@@ -6,12 +6,14 @@ description: "Use Kimi Code CLI with Vibe Kanban"
 Vibe Kanban supports Kimi Code CLI 2.x through the Agent Client Protocol (ACP), including tool activity, approvals and follow-up messages.
 
 <Steps>
-<Step title="Install Kimi Code CLI">
-  Follow the [official installation guide](https://moonshotai.github.io/kimi-code/en/). Make sure the `kimi` executable is available on your PATH.
-</Step>
-
 <Step title="Authenticate">
-  Run `kimi login` in your terminal and complete the login flow before starting an agent session in Vibe Kanban.
+  Run the CLI once to sign in:
+
+  ```bash
+  npx -y @moonshot-ai/kimi-code login
+  ```
+
+  Complete the login flow before starting an agent session in Vibe Kanban.
 </Step>
 
 <Step title="Select Kimi Code">
@@ -21,11 +23,11 @@ Vibe Kanban supports Kimi Code CLI 2.x through the Agent Client Protocol (ACP), 
 
 ## Configuration
 
-Vibe Kanban reads model aliases from `~/.kimi-code/config.toml`. MCP servers configured through Vibe Kanban are saved to `~/.kimi-code/mcp.json`. Set `KIMI_CODE_HOME` before launching Vibe Kanban, or in the agent profile's environment variables, to use a different data directory.
+Vibe Kanban runs the Kimi Code CLI itself, so there is nothing to install. It reads model aliases from `~/.kimi-code/config.toml`. MCP servers configured through Vibe Kanban are saved to `~/.kimi-code/mcp.json`. Set `KIMI_CODE_HOME` before launching Vibe Kanban, or in the agent profile's environment variables, to use a different data directory.
 
 The default profile approves tools automatically. Select **Supervised** to require approval through Vibe Kanban, or set `yolo` to `false` in the agent configuration.
 
-If Vibe Kanban cannot find the executable, set **Base Command Override** to the full path of your `kimi` executable. Vibe Kanban adds the `acp` subcommand and applies model and permission settings through ACP.
+To run your own installation instead of the bundled version, set **Base Command Override** to the full path of your `kimi` executable. Vibe Kanban adds the `acp` subcommand and applies model and permission settings through ACP.
 
 <Note>
 This integration targets the current Kimi Code CLI. If you use the older Python `kimi-cli`, follow Kimi's [migration guide](https://moonshotai.github.io/kimi-code/en/guides/migration.html) first.

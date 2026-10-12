@@ -841,7 +841,7 @@ fn default_discovered_options() -> ExecutorDiscoveredOptions {
 
 impl Codex {
     pub fn base_command() -> &'static str {
-        "npx -y @openai/codex@0.160.0"
+        "npx -y @openai/codex@0.162.1"
     }
 
     fn build_command_builder(&self) -> Result<CommandBuilder, CommandBuildError> {
