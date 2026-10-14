@@ -306,8 +306,8 @@ pub async fn merge_workspace(
             config.merge_commit_prompt.clone().unwrap_or_else(|| {
                 services::services::config::DEFAULT_MERGE_COMMIT_PROMPT.to_string()
             }),
-            // The generation runs as the configured "Default Coding Agent",
-            // independent of whatever agent last ran in the workspace.
+            // Fallback when no coding agent has run in this workspace yet:
+            // the configured "Default Coding Agent".
             config.executor_profile.clone(),
         )
     };
@@ -385,17 +385,21 @@ pub async fn merge_workspace(
         repo.default_working_dir.as_deref(),
     );
 
-    // Decide whether we can resume the workspace's existing agent session. The
-    // generation always runs as the configured default coding agent; when the
-    // workspace's most recent agent already uses that executor *and* ran in the
-    // same directory, we resume its session (cheaper, and keeps the task context
-    // loaded), otherwise we cold-start a fresh session with the default agent. A
-    // workspace where no agent ever ran also cold-starts.
+    // Prefer the agent that last ran in this workspace — it just did the work,
+    // so it is available and its session context is still warm (mirroring
+    // trigger_pr_description_follow_up). Fall back to the configured default
+    // coding agent when no coding agent has run here yet. When the chosen
+    // agent's most recent run happened in the same directory, we resume its
+    // session (cheaper, and keeps the task context loaded); otherwise we
+    // cold-start a fresh session with that agent.
     let latest_profile =
         ExecutionProcess::latest_executor_profile_for_session(pool, session.id).await?;
+    let generation_profile = latest_profile
+        .clone()
+        .unwrap_or_else(|| default_profile.clone());
     let can_resume = services::services::merge_commit::can_resume_session(
         latest_profile.as_ref(),
-        &default_profile,
+        &generation_profile,
         session.agent_working_dir.as_deref(),
         &working_dir,
     );
@@ -409,13 +413,15 @@ pub async fn merge_workspace(
                 prompt,
                 session_id: info.session_id,
                 reset_to_message_id: None,
-                executor_config: executors::profile::ExecutorConfig::from(default_profile.clone()),
+                executor_config: executors::profile::ExecutorConfig::from(
+                    generation_profile.clone(),
+                ),
                 working_dir: working_dir.clone(),
             })
         }
         _ => ExecutorActionType::CodingAgentInitialRequest(CodingAgentInitialRequest {
             prompt,
-            executor_config: executors::profile::ExecutorConfig::from(default_profile.clone()),
+            executor_config: executors::profile::ExecutorConfig::from(generation_profile.clone()),
             working_dir,
         }),
     };

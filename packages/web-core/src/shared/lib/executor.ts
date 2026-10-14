@@ -89,8 +89,13 @@ export function executorConfigFromAction(
 }
 
 /**
- * Get the full ExecutorConfig from the most recent execution process.
- * Searches from most recent to oldest.
+ * Get the full ExecutorConfig from the most recent coding-agent execution
+ * process. Searches from most recent to oldest.
+ *
+ * Processes with other run reasons (e.g. merge-commit message generation,
+ * which runs as the configured default agent rather than the agent the
+ * conversation used) are ignored, mirroring the backend's
+ * `latest_executor_profile_for_session`.
  */
 export function getLatestConfigFromProcesses(
   processes: ExecutionProcess[] | undefined
@@ -100,6 +105,7 @@ export function getLatestConfigFromProcesses(
     processes
       .slice()
       .reverse()
+      .filter((p) => p.run_reason === 'codingagent')
       .map((p) => executorConfigFromAction(p.executor_action ?? null))
       .find((c) => c !== null) ?? null
   );
