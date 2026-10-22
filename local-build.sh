@@ -100,6 +100,11 @@ echo "🧹 Cleaning previous builds..."
 rm -rf npx-cli/dist
 mkdir -p npx-cli/dist/$PLATFORM
 
+# Sync workspace dependencies with the lockfile so a pull that bumps a package
+# doesn't leave stale node_modules behind (the web build would then fail tsc).
+echo "📦 Installing workspace dependencies..."
+pnpm install --frozen-lockfile
+
 echo "🔨 Building web app..."
 (cd packages/local-web && npm run build)
 
