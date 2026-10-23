@@ -1,11 +1,17 @@
 import { useCallback, useEffect, useMemo, useRef, useState } from 'react';
 import type { DropResult } from '@hello-pangea/dnd';
-import { Outlet, useNavigate, useParams } from '@tanstack/react-router';
+import {
+  Outlet,
+  useLocation,
+  useNavigate,
+  useParams,
+} from '@tanstack/react-router';
 import { siDiscord, siGithub } from 'simple-icons';
 import {
   XIcon,
   PlusIcon,
   LayoutIcon,
+  ChartBarIcon,
   KanbanIcon,
   DownloadSimpleIcon,
 } from '@phosphor-icons/react';
@@ -57,6 +63,7 @@ import { CloudShutdownExportBanner } from '@/shared/components/CloudShutdownExpo
 export function SharedAppLayout() {
   const appNavigation = useAppNavigation();
   const currentDestination = useCurrentAppDestination();
+  const pathname = useLocation({ select: (l) => l.pathname });
   const isMobile = useIsMobile();
   const mobileFontScale = useUiPreferencesStore((s) => s.mobileFontScale);
   const isLeftSidebarVisible = useUiPreferencesStore(
@@ -169,6 +176,7 @@ export function SharedAppLayout() {
   );
   const isWorkspacesActive = isLocalWorkspacesDestination(currentDestination);
   const isExportActive = currentDestination?.kind === 'export';
+  const isReportsActive = pathname.startsWith('/reports');
   const showCloudShutdownBanner =
     isExportActive || (isSignedIn && isProjectDestination(currentDestination));
   const isWorkspaceSidebarPreviewEnabled =
@@ -193,6 +201,10 @@ export function SharedAppLayout() {
 
   const handleWorkspacesClick = useCallback(() => {
     void navigate({ to: '/workspaces' });
+  }, [navigate]);
+
+  const handleReportsClick = useCallback(() => {
+    void navigate({ to: '/reports' });
   }, [navigate]);
 
   const handleExportClick = useCallback(() => {
@@ -333,12 +345,14 @@ export function SharedAppLayout() {
               onCreateProject={handleCreateProject}
               onExportClick={handleExportClick}
               onWorkspacesClick={handleWorkspacesClick}
+              onReportsClick={handleReportsClick}
               onHostClick={handleHostClick}
               onPairHostClick={handlePairHostClick}
               onProjectClick={handleProjectClick}
               onProjectsDragEnd={handleProjectsDragEnd}
               isSavingProjectOrder={isSavingProjectOrder}
               isWorkspacesActive={isWorkspacesActive}
+              isReportsActive={isReportsActive}
               isExportActive={isExportActive}
               activeProjectId={activeProjectId}
               isSignedIn={isSignedIn}
@@ -445,6 +459,19 @@ export function SharedAppLayout() {
             >
               <LayoutIcon className="h-4 w-4" />
               Workspaces
+            </button>
+
+            {/* Activity report link */}
+            <button
+              type="button"
+              onClick={() => {
+                handleReportsClick();
+                setIsDrawerOpen(false);
+              }}
+              className="flex items-center gap-2 px-4 py-3 text-sm text-normal hover:bg-secondary cursor-pointer"
+            >
+              <ChartBarIcon className="h-4 w-4" />
+              Activity report
             </button>
 
             {/* Divider */}

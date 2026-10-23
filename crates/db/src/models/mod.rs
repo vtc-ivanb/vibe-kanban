@@ -1,3 +1,4 @@
+pub mod activity_report;
 pub mod coding_agent_turn;
 pub mod execution_process;
 pub mod execution_process_logs;

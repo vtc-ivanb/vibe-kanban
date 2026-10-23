@@ -6,6 +6,7 @@ import {
 } from '@hello-pangea/dnd';
 import type { ReactNode } from 'react';
 import {
+  ChartBarIcon,
   LayoutIcon,
   DownloadSimpleIcon,
   LinkIcon,
@@ -51,12 +52,14 @@ interface AppBarProps {
   onCreateProject: () => void;
   onExportClick?: () => void;
   onWorkspacesClick: () => void;
+  onReportsClick?: () => void;
   onHostClick?: (hostId: string, status: AppBarHostStatus) => void;
   showWorkspacesButton?: boolean;
   onProjectClick: (projectId: string) => void;
   onProjectsDragEnd: (result: DropResult) => void;
   isSavingProjectOrder?: boolean;
   isWorkspacesActive: boolean;
+  isReportsActive?: boolean;
   isExportActive?: boolean;
   activeProjectId: string | null;
   isSignedIn?: boolean;
@@ -203,12 +206,14 @@ export function AppBar({
   onCreateProject,
   onExportClick,
   onWorkspacesClick,
+  onReportsClick,
   onHostClick,
   showWorkspacesButton = true,
   onProjectClick,
   onProjectsDragEnd,
   isSavingProjectOrder,
   isWorkspacesActive,
+  isReportsActive = false,
   isExportActive = false,
   activeProjectId,
   isSignedIn,
@@ -242,6 +247,18 @@ export function AppBar({
           isActive: isWorkspacesActive,
           onClick: onWorkspacesClick,
         },
+        ...(onReportsClick
+          ? [
+              {
+                key: 'activity-report',
+                kind: 'icon-button' as const,
+                label: 'Activity report',
+                icon: ChartBarIcon,
+                isActive: isReportsActive,
+                onClick: onReportsClick,
+              },
+            ]
+          : []),
       ],
     });
   }

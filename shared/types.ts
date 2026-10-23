@@ -264,6 +264,59 @@ export type InitRepoRequest = { parent_path: string, folder_name: string, };
 
 export type TagSearchParams = { search: string | null, };
 
+export type ActivityReportQuery = { 
+/**
+ * Start of the period (inclusive), e.g. local midnight of the first day.
+ */
+from: string, 
+/**
+ * End of the period (exclusive), e.g. local midnight after the last day.
+ */
+to: string, 
+/**
+ * Gaps longer than this between agent output and the user's next action
+ * are treated as the user being away.
+ */
+idle_cap_minutes: number | null, };
+
+export type WorkspaceActivitySummary = { text: string, generated_at: string, 
+/**
+ * The workspace has had agent activity since the summary was generated.
+ */
+is_stale: boolean, };
+
+export type WorkspaceActivity = { workspace_id: string, 
+/**
+ * Workspace name, or its branch when unnamed.
+ */
+name: string, branch: string, archived: boolean, repos: Array<string>, first_activity_at: string | null, last_activity_at: string | null, 
+/**
+ * Estimated time the user spent interacting with this workspace.
+ */
+user_seconds: number, 
+/**
+ * Time coding agents spent running in this workspace.
+ */
+agent_seconds: number, prompt_count: number, merged_at: string | null, summary: WorkspaceActivitySummary | null, };
+
+export type ActivityReport = { from: string, to: string, idle_cap_minutes: number, 
+/**
+ * Wall-clock time with any user activity (parallel work counted once).
+ */
+user_seconds: number, agent_seconds: number, 
+/**
+ * Sorted by estimated user time, most first.
+ */
+workspaces: Array<WorkspaceActivity>, };
+
+export type GenerateReportSummariesRequest = { workspace_ids: Array<string>, executor_profile_id: ExecutorProfileId, };
+
+export type ReportSummaryJobStatus = { running: boolean, total: number, completed: number, failed: number, 
+/**
+ * The most recent generation error, if any.
+ */
+last_error: string | null, };
+
 export type TokenResponse = { access_token: string, expires_at: string | null, };
 
 export type UserSystemInfo = { version: string, config: Config, machine_id: string, login_status: LoginStatus, remote_auth_degraded: string | null, environment: Environment, 

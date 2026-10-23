@@ -1,3 +1,4 @@
+pub mod activity_report;
 pub mod analytics;
 pub mod approvals;
 pub mod auth;
@@ -23,3 +24,4 @@ pub mod queued_message;
 pub mod remote_client;
 pub mod remote_sync;
 pub mod repo;
+pub mod report_summary;

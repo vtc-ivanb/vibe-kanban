@@ -101,6 +101,10 @@ import {
   OpenRemoteWorkspaceInEditorRequest,
   OpenRemoteEditorResponse,
   ProfileResponse,
+  ActivityReport,
+  ActivityReportQuery,
+  GenerateReportSummariesRequest,
+  ReportSummaryJobStatus,
 } from 'shared/types';
 import type { Project as RemoteProject } from 'shared/remote-types';
 import type { WorkspaceWithSession } from '@/shared/types/attempt';
@@ -1705,5 +1709,35 @@ export const searchApi = {
       options
     );
     return handleApiResponse<SearchResult[]>(response);
+  },
+};
+
+// Activity reports API
+export const reportsApi = {
+  getActivity: async (query: ActivityReportQuery): Promise<ActivityReport> => {
+    const params = new URLSearchParams({
+      from: query.from,
+      to: query.to,
+    });
+    if (query.idle_cap_minutes != null) {
+      params.set('idle_cap_minutes', String(query.idle_cap_minutes));
+    }
+    const response = await makeRequest(`/api/reports/activity?${params}`);
+    return handleApiResponse<ActivityReport>(response);
+  },
+
+  generateSummaries: async (
+    data: GenerateReportSummariesRequest
+  ): Promise<ReportSummaryJobStatus> => {
+    const response = await makeRequest('/api/reports/summaries', {
+      method: 'POST',
+      body: JSON.stringify(data),
+    });
+    return handleApiResponse<ReportSummaryJobStatus>(response);
+  },
+
+  getSummaryStatus: async (): Promise<ReportSummaryJobStatus> => {
+    const response = await makeRequest('/api/reports/summaries/status');
+    return handleApiResponse<ReportSummaryJobStatus>(response);
   },
 };
