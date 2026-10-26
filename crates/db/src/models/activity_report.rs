@@ -52,6 +52,8 @@ pub struct ActivityWorkspaceRepo {
 pub struct ActivityTurn {
     pub workspace_id: Uuid,
     pub created_at: DateTime<Utc>,
+    /// When the turn's agent run finished; `None` while it is still running.
+    pub completed_at: Option<DateTime<Utc>>,
     pub prompt: Option<String>,
     pub summary: Option<String>,
 }
@@ -136,32 +138,6 @@ pub async fn find_latest_merges(
         .await
 }
 
-/// Latest coding agent activity per workspace: the most recent completion, or
-/// the start of a run that is still going. It changes only when agent output
-/// changes (not when turns are marked seen), so it versions cached summaries:
-/// a run in flight at generation time moves it forward once it completes.
-pub async fn find_latest_agent_activity(
-    pool: &SqlitePool,
-    workspace_ids: &[Uuid],
-) -> Result<Vec<WorkspaceTimestamp>, sqlx::Error> {
-    if workspace_ids.is_empty() {
-        return Ok(vec![]);
-    }
-    let mut qb: QueryBuilder<Sqlite> = QueryBuilder::new(
-        "SELECT s.workspace_id AS workspace_id,
-                MAX(COALESCE(ep.completed_at, ep.started_at)) AS at
-           FROM execution_processes ep
-           JOIN sessions s ON s.id = ep.session_id
-          WHERE ep.run_reason = 'codingagent'
-            AND s.workspace_id IN (",
-    );
-    push_ids(&mut qb, workspace_ids);
-    qb.push(") GROUP BY s.workspace_id");
-    qb.build_query_as::<WorkspaceTimestamp>()
-        .fetch_all(pool)
-        .await
-}
-
 pub async fn find_workspaces(
     pool: &SqlitePool,
     workspace_ids: &[Uuid],
@@ -208,6 +184,7 @@ pub async fn find_turns_for_workspace(
     sqlx::query_as::<_, ActivityTurn>(
         r#"SELECT s.workspace_id AS workspace_id,
                   cat.created_at AS created_at,
+                  ep.completed_at AS completed_at,
                   cat.prompt AS prompt,
                   cat.summary AS summary
              FROM coding_agent_turns cat
@@ -233,8 +210,13 @@ fn push_ids(qb: &mut QueryBuilder<Sqlite>, ids: &[Uuid]) {
 #[derive(Debug, Clone, FromRow, Serialize, Deserialize, TS)]
 pub struct WorkspaceReportSummary {
     pub workspace_id: Uuid,
+    /// Report period the summary describes, as Unix seconds: `[from, to)`.
+    pub period_from: i64,
+    pub period_to: i64,
+    /// A few words naming the work done in the period.
+    pub title: String,
     pub summary: String,
-    /// Latest workspace activity the summary was generated from.
+    /// Latest agent activity within the period the summary was generated from.
     pub source_activity_at: DateTime<Utc>,
     /// The executor profile (JSON) that generated the summary.
     pub executor_profile: String,
@@ -243,41 +225,58 @@ pub struct WorkspaceReportSummary {
 }
 
 impl WorkspaceReportSummary {
-    pub async fn find_for_workspaces(
+    /// Summaries of the given workspaces for exactly this report period.
+    pub async fn find_for_period(
         pool: &SqlitePool,
         workspace_ids: &[Uuid],
+        from: DateTime<Utc>,
+        to: DateTime<Utc>,
     ) -> Result<Vec<Self>, sqlx::Error> {
         if workspace_ids.is_empty() {
             return Ok(vec![]);
         }
         let mut qb: QueryBuilder<Sqlite> = QueryBuilder::new(
-            "SELECT workspace_id, summary, source_activity_at, executor_profile, created_at, updated_at
+            "SELECT workspace_id, period_from, period_to, title, summary, source_activity_at,
+                    executor_profile, created_at, updated_at
                FROM workspace_report_summaries
-              WHERE workspace_id IN (",
+              WHERE period_from = ",
         );
+        qb.push_bind(from.timestamp());
+        qb.push(" AND period_to = ");
+        qb.push_bind(to.timestamp());
+        qb.push(" AND workspace_id IN (");
         push_ids(&mut qb, workspace_ids);
         qb.push(")");
         qb.build_query_as::<Self>().fetch_all(pool).await
     }
 
+    #[allow(clippy::too_many_arguments)]
     pub async fn upsert(
         pool: &SqlitePool,
         workspace_id: Uuid,
+        from: DateTime<Utc>,
+        to: DateTime<Utc>,
+        title: &str,
         summary: &str,
         source_activity_at: DateTime<Utc>,
         executor_profile: &str,
     ) -> Result<(), sqlx::Error> {
         sqlx::query(
             r#"INSERT INTO workspace_report_summaries
-                   (workspace_id, summary, source_activity_at, executor_profile)
-               VALUES (?, ?, ?, ?)
-               ON CONFLICT(workspace_id) DO UPDATE SET
+                   (workspace_id, period_from, period_to, title, summary,
+                    source_activity_at, executor_profile)
+               VALUES (?, ?, ?, ?, ?, ?, ?)
+               ON CONFLICT(workspace_id, period_from, period_to) DO UPDATE SET
+                   title = excluded.title,
                    summary = excluded.summary,
                    source_activity_at = excluded.source_activity_at,
                    executor_profile = excluded.executor_profile,
                    updated_at = datetime('now', 'subsec')"#,
         )
         .bind(workspace_id)
+        .bind(from.timestamp())
+        .bind(to.timestamp())
+        .bind(title)
         .bind(summary)
         .bind(source_activity_at)
         .bind(executor_profile)

@@ -6,6 +6,7 @@ import {
   presetRange,
   rangeToQuery,
   reportToMarkdown,
+  taskHeading,
 } from './reportUtils';
 
 // Thursday, 23 October 2026, local time.
@@ -32,6 +33,7 @@ function reportFixture(): ActivityReport {
         prompt_count: 4,
         merged_at: null,
         summary: {
+          title: 'Login | redirect fix',
           text: 'Fixed the "remember me" redirect,\nadded tests.',
           generated_at: '2026-10-21T00:00:00Z',
           is_stale: false,
@@ -98,8 +100,20 @@ describe('exports', () => {
       start: '2026-10-20',
       end: '2026-10-20',
     });
-    expect(md).toContain('Fix login \\| redirect');
+    expect(md).toContain('| Login \\| redirect fix |');
+    expect(md).not.toContain('Fix login');
     expect(md).toContain('| 1h 5m | 2h | 4 | no |');
     expect(md).not.toContain('redirect,\nadded');
+  });
+});
+
+describe('taskHeading', () => {
+  it('falls back to the workspace name without a summary title', () => {
+    const ws = reportFixture().workspaces[0];
+    expect(taskHeading(ws)).toBe('Login | redirect fix');
+    expect(taskHeading({ ...ws, summary: null })).toBe('Fix login | redirect');
+    expect(
+      taskHeading({ ...ws, summary: { ...ws.summary!, title: ' ' } })
+    ).toBe('Fix login | redirect');
   });
 });

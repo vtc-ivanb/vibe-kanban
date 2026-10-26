@@ -1,4 +1,4 @@
-import type { ActivityReport } from 'shared/types';
+import type { ActivityReport, WorkspaceActivity } from 'shared/types';
 
 export type RangePreset =
   | 'today'
@@ -129,6 +129,11 @@ export function formatDuration(seconds: number): string {
   return minutes === 0 ? `${hours}h` : `${hours}h ${minutes}m`;
 }
 
+/** The row heading: the period summary's short title, else the workspace name. */
+export function taskHeading(ws: WorkspaceActivity): string {
+  return ws.summary?.title.trim() || ws.name;
+}
+
 function escapeMarkdownCell(text: string): string {
   return text.replace(/\|/g, '\\|').replace(/\r?\n/g, ' ');
 }
@@ -151,7 +156,7 @@ export function reportToMarkdown(report: ActivityReport, range: DateRange) {
   for (const ws of report.workspaces) {
     lines.push(
       `| ${[
-        escapeMarkdownCell(ws.name),
+        escapeMarkdownCell(taskHeading(ws)),
         escapeMarkdownCell(ws.repos.join(', ')),
         formatDuration(ws.user_seconds),
         formatDuration(ws.agent_seconds),

@@ -126,6 +126,37 @@ pub fn compute(input: &ReportInput) -> ComputedReport {
     report
 }
 
+/// Latest coding agent activity within `[from, to)` per workspace: the most
+/// recent completion of a run overlapping the period, or the start of a run
+/// still going. It versions summaries of the period: it changes only when the
+/// period gains agent output, including when a run in flight completes.
+pub fn period_activity_versions(
+    processes: &[ActivityProcess],
+    from: DateTime<Utc>,
+    to: DateTime<Utc>,
+) -> HashMap<Uuid, DateTime<Utc>> {
+    let mut versions: HashMap<Uuid, DateTime<Utc>> = HashMap::new();
+    for p in processes
+        .iter()
+        .filter(|p| p.run_reason == ExecutionProcessRunReason::CodingAgent)
+    {
+        let overlaps = p.started_at < to
+            && match p.completed_at {
+                Some(end) => end >= from,
+                None => p.status == ExecutionProcessStatus::Running || p.started_at >= from,
+            };
+        if !overlaps {
+            continue;
+        }
+        let at = p.completed_at.unwrap_or(p.started_at);
+        versions
+            .entry(p.workspace_id)
+            .and_modify(|v| *v = (*v).max(at))
+            .or_insert(at);
+    }
+    versions
+}
+
 fn process_end(p: &ActivityProcess, now: DateTime<Utc>) -> DateTime<Utc> {
     match (p.completed_at, &p.status) {
         (Some(end), _) => end.max(p.started_at),
@@ -424,5 +455,20 @@ mod tests {
         )];
         let report = run(&processes, &[]);
         assert_eq!(report.workspaces[&ws].agent_seconds, 3600.0);
+    }
+
+    #[test]
+    fn activity_version_only_reflects_the_period() {
+        let ws = Uuid::new_v4();
+        let yesterday = Utc.with_ymd_and_hms(2026, 10, 19, 15, 0, 0).unwrap();
+        let processes = [
+            agent_run(ws, yesterday, yesterday + Duration::minutes(5), None),
+            agent_run(ws, at(9, 0), at(9, 30), None),
+        ];
+        let versions = period_activity_versions(&processes, at(0, 0), at(0, 0) + Duration::days(1));
+        assert_eq!(versions[&ws], at(9, 30));
+
+        let none = period_activity_versions(&processes, at(12, 0), at(13, 0));
+        assert!(none.is_empty());
     }
 }

@@ -17,7 +17,7 @@ use futures_util::{StreamExt, stream};
 use serde::{Deserialize, Serialize};
 use services::services::{
     activity_report::{self as report, ReportInput},
-    report_summary::{self, WorkspaceSummaryInput},
+    report_summary,
 };
 use sqlx::SqlitePool;
 use ts_rs::TS;
@@ -53,9 +53,12 @@ pub struct ActivityReportQuery {
 
 #[derive(Debug, Serialize, TS)]
 pub struct WorkspaceActivitySummary {
+    /// A few words naming the work done in the period, e.g. "Fixing pnpm tests".
+    pub title: String,
+    /// One to three sentences describing the work done in the period.
     pub text: String,
     pub generated_at: DateTime<Utc>,
-    /// The workspace has had agent activity since the summary was generated.
+    /// The period has had agent activity since the summary was generated.
     pub is_stale: bool,
 }
 
@@ -142,25 +145,21 @@ pub async fn get_activity_report(
             .map(|m| (m.workspace_id, m.at))
             .collect();
     let summaries: HashMap<Uuid, WorkspaceReportSummary> =
-        WorkspaceReportSummary::find_for_workspaces(pool, &ids)
+        WorkspaceReportSummary::find_for_period(pool, &ids, from, to)
             .await?
             .into_iter()
             .map(|s| (s.workspace_id, s))
             .collect();
-    // Compared workspace-wide, not just within the period, so newer activity
-    // or a run that completed after generation marks the summary stale.
-    let latest_activity: HashMap<Uuid, DateTime<Utc>> =
-        activity_report::find_latest_agent_activity(pool, &ids)
-            .await?
-            .into_iter()
-            .map(|t| (t.workspace_id, t.at))
-            .collect();
+    // Newer agent activity in the period, including a run that was in flight
+    // when the summary was generated, marks the summary stale.
+    let latest_activity = report::period_activity_versions(&processes, from, to);
 
     let mut rows: Vec<WorkspaceActivity> = workspaces
         .into_iter()
         .filter_map(|ws| {
             let totals = computed.workspaces.get(&ws.id)?;
             let summary = summaries.get(&ws.id).map(|s| WorkspaceActivitySummary {
+                title: s.title.clone(),
                 text: s.summary.clone(),
                 generated_at: s.updated_at,
                 is_stale: latest_activity
@@ -206,6 +205,9 @@ pub async fn get_activity_report(
 pub struct GenerateReportSummariesRequest {
     pub workspace_ids: Vec<Uuid>,
     pub executor_profile_id: ExecutorProfileId,
+    /// Report period to summarize (`[from, to)`); only work in it is described.
+    pub from: DateTime<Utc>,
+    pub to: DateTime<Utc>,
 }
 
 #[derive(Debug, Clone, Default, Serialize, TS)]
@@ -253,6 +255,12 @@ pub async fn generate_summaries(
             request.executor_profile_id
         )));
     }
+    let (from, to) = (request.from, request.to);
+    if to <= from {
+        return Err(ApiError::BadRequest(
+            "`to` must be after `from`".to_string(),
+        ));
+    }
     let mut ids = request.workspace_ids;
     ids.sort();
     ids.dedup();
@@ -277,14 +285,20 @@ pub async fn generate_summaries(
     let pool = deployment.db().pool.clone();
     let profile = request.executor_profile_id;
     tokio::spawn(async move {
-        run_summary_job(pool, profile, ids).await;
+        run_summary_job(pool, profile, ids, from, to).await;
         update_job(|job| job.running = false);
     });
 
     Ok(ResponseJson(ApiResponse::success(job_status())))
 }
 
-async fn run_summary_job(pool: SqlitePool, profile: ExecutorProfileId, ids: Vec<Uuid>) {
+async fn run_summary_job(
+    pool: SqlitePool,
+    profile: ExecutorProfileId,
+    ids: Vec<Uuid>,
+    from: DateTime<Utc>,
+    to: DateTime<Utc>,
+) {
     let profile_json = serde_json::to_string(&profile).unwrap_or_default();
     let batches: Vec<Vec<Uuid>> = ids
         .chunks(SUMMARY_BATCH_SIZE)
@@ -298,7 +312,7 @@ async fn run_summary_job(pool: SqlitePool, profile: ExecutorProfileId, ids: Vec<
             let profile_json = profile_json.clone();
             async move {
                 let batch_len = batch.len() as u32;
-                match summarize_batch(&pool, &profile, &profile_json, &batch).await {
+                match summarize_batch(&pool, &profile, &profile_json, &batch, from, to).await {
                     Ok(written) => update_job(|job| {
                         job.completed += written;
                         job.failed += batch_len - written;
@@ -316,12 +330,15 @@ async fn run_summary_job(pool: SqlitePool, profile: ExecutorProfileId, ids: Vec<
         .await;
 }
 
-/// Summarizes one batch and stores the results. Returns how many summaries were written.
+/// Summarizes the work one batch of workspaces did in `[from, to)` and stores
+/// the results. Returns how many summaries were written.
 async fn summarize_batch(
     pool: &SqlitePool,
     profile: &ExecutorProfileId,
     profile_json: &str,
     batch: &[Uuid],
+    from: DateTime<Utc>,
+    to: DateTime<Utc>,
 ) -> Result<u32, String> {
     let workspaces = activity_report::find_workspaces(pool, batch)
         .await
@@ -329,13 +346,10 @@ async fn summarize_batch(
 
     // Captured before reading turns, so anything that changes afterwards
     // (including a run still in flight) leaves the summary stale.
-    let source_activity: HashMap<Uuid, DateTime<Utc>> =
-        activity_report::find_latest_agent_activity(pool, batch)
-            .await
-            .map_err(|e| e.to_string())?
-            .into_iter()
-            .map(|t| (t.workspace_id, t.at))
-            .collect();
+    let processes = activity_report::find_processes_between(pool, from - Duration::days(1), to)
+        .await
+        .map_err(|e| e.to_string())?;
+    let source_activity = report::period_activity_versions(&processes, from, to);
 
     let mut inputs = Vec::new();
     for ws in workspaces {
@@ -345,17 +359,13 @@ async fn summarize_batch(
         let turns = activity_report::find_turns_for_workspace(pool, ws.id)
             .await
             .map_err(|e| e.to_string())?;
-        if turns.is_empty() {
-            continue;
+        let name = ws
+            .name
+            .filter(|n| !n.trim().is_empty())
+            .unwrap_or(ws.branch);
+        if let Some(input) = report_summary::input_for_period(ws.id, name, turns, from, to) {
+            inputs.push(input);
         }
-        inputs.push(WorkspaceSummaryInput {
-            workspace_id: ws.id,
-            title: ws
-                .name
-                .filter(|n| !n.trim().is_empty())
-                .unwrap_or(ws.branch),
-            turns,
-        });
     }
     if inputs.is_empty() {
         return Ok(0);
@@ -366,14 +376,17 @@ async fn summarize_batch(
         .map_err(|e| e.to_string())?;
 
     let mut written = 0;
-    for (workspace_id, summary) in summaries {
+    for (workspace_id, generated) in summaries {
         let Some(&source_activity_at) = source_activity.get(&workspace_id) else {
             continue;
         };
         WorkspaceReportSummary::upsert(
             pool,
             workspace_id,
-            &summary,
+            from,
+            to,
+            &generated.title,
+            &generated.summary,
             source_activity_at,
             profile_json,
         )

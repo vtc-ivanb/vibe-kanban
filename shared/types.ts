@@ -279,9 +279,17 @@ to: string,
  */
 idle_cap_minutes: number | null, };
 
-export type WorkspaceActivitySummary = { text: string, generated_at: string, 
+export type WorkspaceActivitySummary = { 
 /**
- * The workspace has had agent activity since the summary was generated.
+ * A few words naming the work done in the period, e.g. "Fixing pnpm tests".
+ */
+title: string, 
+/**
+ * One to three sentences describing the work done in the period.
+ */
+text: string, generated_at: string, 
+/**
+ * The period has had agent activity since the summary was generated.
  */
 is_stale: boolean, };
 
@@ -309,7 +317,11 @@ user_seconds: number, agent_seconds: number,
  */
 workspaces: Array<WorkspaceActivity>, };
 
-export type GenerateReportSummariesRequest = { workspace_ids: Array<string>, executor_profile_id: ExecutorProfileId, };
+export type GenerateReportSummariesRequest = { workspace_ids: Array<string>, executor_profile_id: ExecutorProfileId, 
+/**
+ * Report period to summarize (`[from, to)`); only work in it is described.
+ */
+from: string, to: string, };
 
 export type ReportSummaryJobStatus = { running: boolean, total: number, completed: number, failed: number, 
 /**

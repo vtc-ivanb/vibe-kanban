@@ -12,6 +12,7 @@
 use std::{collections::HashMap, path::Path, sync::Arc, time::Duration};
 
 use async_trait::async_trait;
+use chrono::{DateTime, Utc};
 use db::models::activity_report::ActivityTurn;
 use executors::{
     approvals::{ExecutorApprovalError, ExecutorApprovalService},
@@ -134,7 +135,48 @@ impl ExecutorApprovalService for DenyAllApprovals {
 pub struct WorkspaceSummaryInput {
     pub workspace_id: Uuid,
     pub title: String,
+    /// The task's original request, when it predates the period. Background
+    /// only: the summary must describe just `turns`.
+    pub goal: Option<String>,
+    /// Turns that overlap the report period, oldest first.
     pub turns: Vec<ActivityTurn>,
+}
+
+/// A generated summary of one workspace's work in a period.
+#[derive(Debug, Clone, PartialEq)]
+pub struct GeneratedSummary {
+    /// A few words naming the work, e.g. "Fixing pnpm tests".
+    pub title: String,
+    /// One to three sentences describing what was done.
+    pub summary: String,
+}
+
+const MAX_GOAL_CHARS: usize = 600;
+
+/// Builds the summary input for a period from a workspace's full history:
+/// turns whose agent run overlaps `[from, to)`, plus the original request as
+/// background when the task started earlier. `None` if nothing overlaps.
+pub fn input_for_period(
+    workspace_id: Uuid,
+    title: String,
+    all_turns: Vec<ActivityTurn>,
+    from: DateTime<Utc>,
+    to: DateTime<Utc>,
+) -> Option<WorkspaceSummaryInput> {
+    let goal = all_turns
+        .first()
+        .filter(|t| t.created_at < from)
+        .and_then(|t| t.prompt.clone());
+    let turns: Vec<ActivityTurn> = all_turns
+        .into_iter()
+        .filter(|t| t.created_at < to && t.completed_at.unwrap_or(t.created_at) >= from)
+        .collect();
+    (!turns.is_empty()).then_some(WorkspaceSummaryInput {
+        workspace_id,
+        title,
+        goal,
+        turns,
+    })
 }
 
 fn truncate(text: &str, max_chars: usize) -> String {
@@ -201,9 +243,16 @@ fn render_workspace(input: &WorkspaceSummaryInput) -> String {
     let omitted = hi - lo;
 
     let mut out = format!(
-        "## Workspace `{}`\nTitle: {}\n\n",
+        "## Workspace `{}`\nWorkspace name: {}\n\n",
         input.workspace_id, input.title
     );
+    if let Some(goal) = input.goal.as_deref().filter(|g| !g.trim().is_empty()) {
+        out.push_str(&format!(
+            "Original request (background only; it was made before this period):\n{}\n\n",
+            truncate(goal, MAX_GOAL_CHARS)
+        ));
+    }
+    out.push_str("### Work in this period\n\n");
     out.push_str(&kept_head.concat());
     if omitted > 0 {
         out.push_str(&format!("_({omitted} turns omitted)_\n\n"));
@@ -216,7 +265,8 @@ fn render_workspace(input: &WorkspaceSummaryInput) -> String {
 pub fn build_input_document(inputs: &[WorkspaceSummaryInput]) -> String {
     let mut doc = String::from(
         "# Workspace activity\n\nEach section below is one task (workspace) a developer worked on \
-         with a coding agent: the developer's prompts and the agent's results, oldest first.\n\n",
+         with a coding agent during the report period: the developer's prompts and the agent's \
+         results, oldest first.\n\n",
     );
     for input in inputs {
         doc.push_str(&render_workspace(input));
@@ -232,21 +282,27 @@ pub fn build_prompt(inputs: &[WorkspaceSummaryInput]) -> String {
         .collect::<Vec<_>>()
         .join(", ");
     format!(
-        "You are writing entries for a developer's work report. Below is the activity of {count} \
-         tasks the developer worked on with a coding agent.\n\n\
-         For each task write a summary of 1-3 sentences describing what was accomplished \
-         (the outcome, not the conversation), in past tense, as the developer would write it \
-         in a timesheet. Do not mention the agent, prompts or turns.\n\n\
+        "You are writing entries for a developer's work report for one period. Below is the \
+         activity of {count} tasks the developer worked on with a coding agent in that period.\n\n\
+         Describe only the work under \"Work in this period\". An \"Original request\" is \
+         background for understanding; do not describe work it asks for unless that work \
+         appears in the period.\n\n\
+         For each task write:\n\
+         - \"title\": 2-5 words naming the work done in the period, like a timesheet line \
+         (e.g. \"Fixing pnpm tests\", \"Cursor lag investigation\"). Not the workspace name.\n\
+         - \"summary\": 1-3 sentences describing what was accomplished in the period (the \
+         outcome, not the conversation), in past tense. Do not mention the agent, prompts or \
+         turns.\n\n\
          Do not use any tools, read or write files, or run commands: everything you need is \
-         below. Reply with only a JSON object mapping each workspace id to its summary, with \
-         exactly these keys: [{ids}].\n\n---\n\n{document}",
+         below. Reply with only a JSON object mapping each workspace id to \
+         {{\"title\": ..., \"summary\": ...}}, with exactly these keys: [{ids}].\n\n---\n\n{document}",
         count = inputs.len(),
         document = build_input_document(inputs),
     )
 }
 
 /// Parses the agent's output, tolerating a markdown code fence around the JSON.
-pub fn parse_output(raw: &str) -> Result<HashMap<Uuid, String>, ReportSummaryError> {
+pub fn parse_output(raw: &str) -> Result<HashMap<Uuid, GeneratedSummary>, ReportSummaryError> {
     let trimmed = raw.trim();
     let json = match (trimmed.find('{'), trimmed.rfind('}')) {
         (Some(start), Some(end)) if end > start => &trimmed[start..=end],
@@ -256,14 +312,29 @@ pub fn parse_output(raw: &str) -> Result<HashMap<Uuid, String>, ReportSummaryErr
             ));
         }
     };
-    let map: HashMap<String, String> =
+    #[derive(serde::Deserialize)]
+    struct Entry {
+        #[serde(default)]
+        title: String,
+        #[serde(default)]
+        summary: String,
+    }
+    let map: HashMap<String, Entry> =
         serde_json::from_str(json).map_err(|e| ReportSummaryError::InvalidOutput(e.to_string()))?;
     Ok(map
         .into_iter()
         .filter_map(|(k, v)| {
             let id = Uuid::parse_str(k.trim()).ok()?;
-            let v = v.trim().to_string();
-            (!v.is_empty()).then_some((id, v))
+            let summary = v.summary.trim().to_string();
+            (!summary.is_empty()).then(|| {
+                (
+                    id,
+                    GeneratedSummary {
+                        title: v.title.trim().to_string(),
+                        summary,
+                    },
+                )
+            })
         })
         .collect())
 }
@@ -273,7 +344,7 @@ pub fn parse_output(raw: &str) -> Result<HashMap<Uuid, String>, ReportSummaryErr
 pub async fn generate_summaries(
     profile: &ExecutorProfileId,
     inputs: &[WorkspaceSummaryInput],
-) -> Result<HashMap<Uuid, String>, ReportSummaryError> {
+) -> Result<HashMap<Uuid, GeneratedSummary>, ReportSummaryError> {
     let dir = std::env::temp_dir().join(format!("vk-report-summary-{}", Uuid::new_v4()));
     tokio::fs::create_dir_all(&dir).await?;
     let result = run_in_dir(&dir, profile, inputs).await;
@@ -285,7 +356,7 @@ async fn run_in_dir(
     dir: &Path,
     profile: &ExecutorProfileId,
     inputs: &[WorkspaceSummaryInput],
-) -> Result<HashMap<Uuid, String>, ReportSummaryError> {
+) -> Result<HashMap<Uuid, GeneratedSummary>, ReportSummaryError> {
     if !supports_tool_free_runs(profile) {
         return Err(ReportSummaryError::Spawn(format!(
             "{} cannot be restricted to running without tools",
@@ -382,14 +453,13 @@ fn last_assistant_message(history: &[LogMsg]) -> Option<String> {
 
 #[cfg(test)]
 mod tests {
-    use chrono::Utc;
-
     use super::*;
 
     fn turn(prompt: &str, summary: &str) -> ActivityTurn {
         ActivityTurn {
             workspace_id: Uuid::nil(),
             created_at: Utc::now(),
+            completed_at: Some(Utc::now()),
             prompt: Some(prompt.to_string()),
             summary: Some(summary.to_string()),
         }
@@ -398,11 +468,19 @@ mod tests {
     #[test]
     fn parses_fenced_json_and_skips_bad_keys() {
         let id = Uuid::new_v4();
-        let raw =
-            format!("```json\n{{\"{id}\": \" Fixed the login bug. \", \"nope\": \"x\"}}\n```");
+        let raw = format!(
+            "```json\n{{\"{id}\": {{\"title\": \" Login fix \", \"summary\": \" Fixed the login bug. \"}}, \
+             \"nope\": {{\"title\": \"x\", \"summary\": \"x\"}}}}\n```"
+        );
         let parsed = parse_output(&raw).unwrap();
         assert_eq!(parsed.len(), 1);
-        assert_eq!(parsed[&id], "Fixed the login bug.");
+        assert_eq!(
+            parsed[&id],
+            GeneratedSummary {
+                title: "Login fix".to_string(),
+                summary: "Fixed the login bug.".to_string(),
+            }
+        );
     }
 
     #[test]
@@ -419,6 +497,7 @@ mod tests {
         let doc = render_workspace(&WorkspaceSummaryInput {
             workspace_id: Uuid::nil(),
             title: "Task".to_string(),
+            goal: None,
             turns,
         });
         assert!(doc.contains("FIRST GOAL"));
@@ -436,6 +515,7 @@ mod tests {
         let doc = render_workspace(&WorkspaceSummaryInput {
             workspace_id: Uuid::nil(),
             title: "Task".to_string(),
+            goal: None,
             turns,
         });
         assert!(!doc.contains("turns omitted"));
@@ -481,5 +561,61 @@ mod tests {
         assert!(supports_tool_free_runs(&ExecutorProfileId::new(
             BaseCodingAgent::ClaudeCode
         )));
+    }
+
+    #[test]
+    fn period_input_keeps_only_overlapping_turns_and_old_goal() {
+        use chrono::TimeZone;
+        let t = |d, h| Utc.with_ymd_and_hms(2026, 10, d, h, 0, 0).unwrap();
+        let turn_at = |created, completed, prompt: &str| ActivityTurn {
+            workspace_id: Uuid::nil(),
+            created_at: created,
+            completed_at: completed,
+            prompt: Some(prompt.to_string()),
+            summary: Some("done".to_string()),
+        };
+        let turns = vec![
+            turn_at(t(21, 9), Some(t(21, 10)), "Fix cursor lag"),
+            turn_at(t(22, 23), Some(t(23, 1)), "Run the tests"),
+            turn_at(t(23, 9), Some(t(23, 10)), "Fix pnpm tests"),
+            turn_at(t(24, 9), Some(t(24, 10)), "Tomorrow"),
+        ];
+        let input =
+            input_for_period(Uuid::nil(), "ws".to_string(), turns, t(23, 0), t(24, 0)).unwrap();
+        let prompts: Vec<_> = input
+            .turns
+            .iter()
+            .filter_map(|t| t.prompt.clone())
+            .collect();
+        assert_eq!(prompts, ["Run the tests", "Fix pnpm tests"]);
+        assert_eq!(input.goal.as_deref(), Some("Fix cursor lag"));
+
+        let doc = render_workspace(&input);
+        assert!(doc.contains("background only"));
+        assert!(doc.contains("Work in this period"));
+    }
+
+    #[test]
+    fn period_without_turns_yields_no_input() {
+        use chrono::TimeZone;
+        let created = Utc.with_ymd_and_hms(2026, 10, 21, 9, 0, 0).unwrap();
+        let turns = vec![ActivityTurn {
+            workspace_id: Uuid::nil(),
+            created_at: created,
+            completed_at: Some(created),
+            prompt: Some("old".to_string()),
+            summary: None,
+        }];
+        let from = Utc.with_ymd_and_hms(2026, 10, 23, 0, 0, 0).unwrap();
+        assert!(
+            input_for_period(
+                Uuid::nil(),
+                "ws".into(),
+                turns,
+                from,
+                from + chrono::Duration::days(1)
+            )
+            .is_none()
+        );
     }
 }

@@ -29,6 +29,7 @@ import {
   MAX_REPORT_DAYS,
   presetRange,
   rangeToQuery,
+  taskHeading,
   reportToMarkdown,
 } from './reportUtils';
 
@@ -82,7 +83,9 @@ function WorkspaceRow({
         </td>
         <td className="py-half pr-base">
           <div className="flex items-center gap-half">
-            <span className="text-base text-high">{workspace.name}</span>
+            <span className="text-base text-high">
+              {taskHeading(workspace)}
+            </span>
             {workspace.merged_at && (
               <span className="text-xs uppercase tracking-wide text-success">
                 merged
@@ -136,6 +139,12 @@ function WorkspaceRow({
           <td />
           <td colSpan={5} className="pb-base pr-base">
             <div className="flex flex-wrap gap-x-double gap-y-half text-sm text-low pt-half">
+              {workspace.summary && (
+                <span className="basis-full">
+                  Workspace:{' '}
+                  <span className="text-normal">{workspace.name}</span>
+                </span>
+              )}
               <span>
                 Branch:{' '}
                 <span className="font-ibm-plex-mono text-normal">
@@ -232,9 +241,13 @@ export function ReportsPage() {
   const generateMutation = useMutation({
     mutationFn: (workspaceIds: string[]) => {
       if (!effectiveProfile) throw new Error('Select an agent first');
+      if (!report) throw new Error('Load a report first');
+      // Summaries describe the period of the report on screen.
       return reportsApi.generateSummaries({
         workspace_ids: workspaceIds,
         executor_profile_id: effectiveProfile,
+        from: report.from,
+        to: report.to,
       });
     },
     onSuccess: (status) => {
