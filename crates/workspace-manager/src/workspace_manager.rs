@@ -553,6 +553,11 @@ impl WorkspaceManager {
         let default_dir = WorktreeManager::get_default_worktree_base_dir();
         self.cleanup_orphans_in_directory(&default_dir).await;
 
+        // Subdirectory used by older versions inside the custom path
+        if let Some(legacy_dir) = WorktreeManager::get_legacy_custom_worktree_base_dir() {
+            self.cleanup_orphans_in_directory(&legacy_dir).await;
+        }
+
         // Also clean up custom directory if it's different from the default
         let current_dir = Self::get_workspace_base_dir();
         if current_dir != default_dir {

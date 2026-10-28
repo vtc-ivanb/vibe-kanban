@@ -7,6 +7,11 @@ use std::{
 
 static WORKSPACE_DIR_OVERRIDE: OnceLock<PathBuf> = OnceLock::new();
 
+/// App-owned subdirectory created inside a custom workspace path (kept short for
+/// Windows path limits).
+const WORKSPACE_SUBDIR: &str = ".vkw";
+const LEGACY_WORKSPACE_SUBDIR: &str = ".vibe-kanban-workspaces";
+
 use git::{GitService, GitServiceError};
 use thiserror::Error;
 use tracing::{debug, info, trace, warn};
@@ -548,9 +553,17 @@ impl WorktreeManager {
         if let Some(override_path) = WORKSPACE_DIR_OVERRIDE.get() {
             // Always use app-owned subdirectory within custom path for safety.
             // This ensures orphan cleanup never touches user's existing folders.
-            return override_path.join(".vibe-kanban-workspaces");
+            return override_path.join(WORKSPACE_SUBDIR);
         }
         Self::get_default_worktree_base_dir()
+    }
+
+    /// App-owned subdirectory older versions created inside the custom path.
+    /// Workspaces created there keep working; it is only consulted for orphan cleanup.
+    pub fn get_legacy_custom_worktree_base_dir() -> Option<std::path::PathBuf> {
+        WORKSPACE_DIR_OVERRIDE
+            .get()
+            .map(|p| p.join(LEGACY_WORKSPACE_SUBDIR))
     }
 
     /// Get the default base directory (ignoring any override)
