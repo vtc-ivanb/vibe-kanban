@@ -1738,6 +1738,7 @@ impl ContainerService for LocalContainerService {
             match executor_action.base_executor() {
                 Some(
                     BaseCodingAgent::Codex
+                    | BaseCodingAgent::Copilot
                     | BaseCodingAgent::ClaudeCode
                     | BaseCodingAgent::Gemini
                     | BaseCodingAgent::QwenCode
