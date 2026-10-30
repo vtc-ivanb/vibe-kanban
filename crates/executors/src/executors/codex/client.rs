@@ -20,7 +20,7 @@ use codex_app_server_protocol::{
     ListMcpServerStatusParams, ListMcpServerStatusResponse, McpServerStatusDetail, ModelListParams,
     ModelListResponse, RequestId, ReviewStartParams, ReviewStartResponse, ReviewTarget,
     ServerRequest, ThreadCompactStartParams, ThreadCompactStartResponse, ThreadForkParams,
-    ThreadForkResponse, ThreadItem, ThreadReadParams, ThreadReadResponse, ThreadStartParams,
+    ThreadForkResponse, ThreadItemPayload, ThreadReadParams, ThreadReadResponse, ThreadStartParams,
     ThreadStartResponse, ToolRequestUserInputAnswer, ToolRequestUserInputQuestion,
     ToolRequestUserInputResponse, TurnCompletedNotification, TurnStartParams, TurnStartResponse,
     TurnStatus, UserInput,
@@ -902,7 +902,7 @@ impl JsonRpcCallbacks for AppServerClient {
             && let Some(ref params) = notification.params
             && let Ok(completed) =
                 serde_json::from_value::<ItemCompletedNotification>(params.clone())
-            && let ThreadItem::Plan { id, .. } = completed.item
+            && let ThreadItemPayload::Plan { id, .. } = completed.item.payload
         {
             *self.pending_plan.lock().await = Some(PendingPlan { item_id: id });
         }

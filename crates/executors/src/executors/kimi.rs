@@ -48,7 +48,7 @@ impl KimiCode {
         // `kimi acp` accepts neither --model nor --yolo. Configure the session
         // over ACP so the same settings apply to initial and follow-up runs.
         apply_overrides(
-            CommandBuilder::new("npx -y @moonshot-ai/kimi-code@2.1.1").params(["acp"]),
+            CommandBuilder::new("npx -y @moonshot-ai/kimi-code@2.4.0").params(["acp"]),
             &self.cmd,
         )
     }
@@ -266,7 +266,7 @@ mod tests {
         agent.model = Some("kimi-code/kimi-for-coding".into());
         agent.yolo = Some(true);
         let builder = agent.build_command_builder().unwrap();
-        assert_eq!(builder.base, "npx -y @moonshot-ai/kimi-code@2.1.1");
+        assert_eq!(builder.base, "npx -y @moonshot-ai/kimi-code@2.4.0");
         assert_eq!(builder.params.unwrap(), ["acp"]);
 
         agent.cmd.base_command_override = Some("/custom/bin/kimi".into());

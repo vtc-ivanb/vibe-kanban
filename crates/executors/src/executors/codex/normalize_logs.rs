@@ -13,7 +13,7 @@ use codex_app_server_protocol::{
     ItemStartedNotification as AppItemStartedNotification, JSONRPCNotification, JSONRPCRequest,
     JSONRPCResponse, McpToolCallProgressNotification, McpToolCallStatus as AppMcpToolCallStatus,
     PatchApplyStatus as AppPatchApplyStatus, ServerNotification, ServerRequest, ThreadForkResponse,
-    ThreadItem as AppThreadItem, ThreadStartResponse, ThreadTokenUsageUpdatedNotification,
+    ThreadItemPayload as AppThreadItem, ThreadStartResponse, ThreadTokenUsageUpdatedNotification,
     ToolRequestUserInputQuestion,
 };
 use codex_protocol::{
@@ -902,7 +902,7 @@ fn handle_direct_item_started(
     state.assistant = None;
     state.thinking = None;
 
-    match notification.item {
+    match notification.item.payload {
         AppThreadItem::Plan { id, .. } => {
             let mut plan_state = PlanState {
                 index: None,
@@ -1044,7 +1044,7 @@ fn handle_direct_item_completed(
     entry_index: &EntryIndexProvider,
     worktree_path: &str,
 ) {
-    match notification.item {
+    match notification.item.payload {
         AppThreadItem::AgentMessage { text, .. } => {
             state.thinking = None;
             let (entry, index, is_new) = state.assistant_message(text);
@@ -2430,7 +2430,9 @@ pub fn normalize_logs(
                 // Surfaced through the `modelProvider/authRecovery*`
                 // notifications instead, which is what the app server sends.
                 | EventMsg::AuthRecoveryStarted(..)
-                | EventMsg::AuthRecoveryCompleted(..) => {}
+                | EventMsg::AuthRecoveryCompleted(..)
+                | EventMsg::ElicitationAbandoned(..)
+                | EventMsg::PrivateSessionEvent(..) => {}
             }
         }
     });
