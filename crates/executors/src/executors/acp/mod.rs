@@ -1,3 +1,4 @@
+pub mod background_tasks;
 pub mod client;
 pub mod harness;
 pub mod normalize_logs;
@@ -31,6 +32,8 @@ pub enum AcpEvent {
     },
     ApprovalResponse(ApprovalResponse),
     Error(String),
+    /// Informational message from vibe-kanban itself, shown as a system message.
+    Notice(String),
     Done(String),
     Other(agent_client_protocol::SessionNotification),
 }

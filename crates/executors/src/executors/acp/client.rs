@@ -55,6 +55,11 @@ impl AcpClient {
         }
     }
 
+    /// Emit an event as if it came from the agent session.
+    pub fn record_event(&self, event: AcpEvent) {
+        self.send_event(event);
+    }
+
     pub fn record_user_prompt_event(&self, prompt: &str) {
         self.send_event(AcpEvent::User(prompt.to_string()));
     }

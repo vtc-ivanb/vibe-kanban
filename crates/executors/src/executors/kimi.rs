@@ -54,13 +54,13 @@ impl KimiCode {
     }
 
     fn harness(&self) -> AcpAgentHarness {
-        let mut harness = AcpAgentHarness::with_session_namespace("kimi_sessions").with_mode(
-            if self.yolo.unwrap_or(false) {
+        let mut harness = AcpAgentHarness::with_session_namespace("kimi_sessions")
+            .with_mode(if self.yolo.unwrap_or(false) {
                 "yolo"
             } else {
                 "default"
-            },
-        );
+            })
+            .with_background_task_wait();
         if let Some(model) = &self.model {
             harness = harness.with_model(model);
         }

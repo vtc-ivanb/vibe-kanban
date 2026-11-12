@@ -24,7 +24,10 @@ use workspace_utils::{
     approvals::ApprovalStatus, command_ext::GroupSpawnNoWindowExt, stream_lines::LinesStreamExt,
 };
 
-use super::{AcpClient, SessionManager};
+use super::{
+    AcpClient, SessionManager,
+    background_tasks::{self, AfterTurn, BackgroundTaskTracker, StdoutObserver, WaitPolicy},
+};
 use crate::{
     approvals::ExecutorApprovalService,
     command::{CmdOverrides, CommandParts},
@@ -37,6 +40,7 @@ pub struct AcpAgentHarness {
     session_namespace: String,
     model: Option<String>,
     mode: Option<String>,
+    wait_for_background_tasks: bool,
 }
 
 impl Default for AcpAgentHarness {
@@ -53,6 +57,7 @@ impl AcpAgentHarness {
             session_namespace: "gemini_sessions".to_string(),
             model: None,
             mode: None,
+            wait_for_background_tasks: false,
         }
     }
 
@@ -62,6 +67,7 @@ impl AcpAgentHarness {
             session_namespace: namespace.into(),
             model: None,
             mode: None,
+            wait_for_background_tasks: false,
         }
     }
 
@@ -72,6 +78,15 @@ impl AcpAgentHarness {
 
     pub fn with_mode(mut self, mode: impl Into<String>) -> Self {
         self.mode = Some(mode.into());
+        self
+    }
+
+    /// Keep the turn going while background tasks the agent started are
+    /// still running, instead of letting them be killed when it ends. Relies
+    /// on Kimi Code's background task output and a POSIX shell, so it only
+    /// takes effect on unix; see [`background_tasks`].
+    pub fn with_background_task_wait(mut self) -> Self {
+        self.wait_for_background_tasks = true;
         self
     }
 
@@ -125,6 +140,7 @@ impl AcpAgentHarness {
             self.session_namespace.clone(),
             self.model.clone(),
             self.mode.clone(),
+            self.wait_for_background_tasks,
             approvals,
             cancel.clone(),
         )
@@ -180,6 +196,7 @@ impl AcpAgentHarness {
             self.session_namespace.clone(),
             self.model.clone(),
             self.mode.clone(),
+            self.wait_for_background_tasks,
             approvals,
             cancel.clone(),
         )
@@ -203,9 +220,14 @@ impl AcpAgentHarness {
         session_namespace: String,
         model: Option<String>,
         mode: Option<String>,
+        wait_for_background_tasks: bool,
         approvals: Option<std::sync::Arc<dyn ExecutorApprovalService>>,
         cancel: CancellationToken,
     ) -> Result<(), ExecutorError> {
+        let agent_pid = child.id();
+        let background_tasks =
+            (wait_for_background_tasks && cfg!(unix)).then(BackgroundTaskTracker::default);
+
         // Take child's stdio for ACP wiring
         let orig_stdout = child.inner().stdout.take().ok_or_else(|| {
             ExecutorError::Io(std::io::Error::new(
@@ -243,6 +265,7 @@ impl AcpAgentHarness {
         let replay_tracker = Arc::new(ProtocolReplayTracker::default());
         let stdout_replay_tracker = replay_tracker.clone();
         let stdout_shutdown_rx = shutdown_rx.clone();
+        let mut stdout_observer = background_tasks.clone().map(StdoutObserver::new);
         tokio::spawn(async move {
             let mut stdout = BufReader::new(orig_stdout);
             let mut line = String::new();
@@ -254,6 +277,11 @@ impl AcpAgentHarness {
                 match stdout.read_line(&mut line).await {
                     Ok(0) => break,
                     Ok(_) => {
+                        // Observe before forwarding, so tool updates are tracked
+                        // before the ACP connection can resolve a later response.
+                        if let Some(observer) = &mut stdout_observer {
+                            observer.observe(line.as_bytes());
+                        }
                         stdout_replay_tracker.record(&line);
                         let _ = to_acp_writer.write_all(line.as_bytes()).await;
                     }
@@ -328,6 +356,7 @@ impl AcpAgentHarness {
                         // Create ACP client with approvals support
                         let client =
                             AcpClient::new(event_tx.clone(), approvals.clone(), cancel.clone());
+                        let mut wait_policy = WaitPolicy::default();
                         let client_feedback_handle = client.clone();
 
                         client.record_user_prompt_event(&prompt);
@@ -476,8 +505,10 @@ impl AcpAgentHarness {
                                 result = conn.prompt(req) => result,
                             };
 
+                            let mut turn_ended = false;
                             match prompt_result {
                                 Ok(resp) => {
+                                    turn_ended = resp.stop_reason == proto::StopReason::EndTurn;
                                     // Emit done with stop_reason
                                     let stop_reason = serde_json::to_string(&resp.stop_reason)
                                         .unwrap_or_default();
@@ -517,19 +548,56 @@ impl AcpAgentHarness {
                                 );
                                 current_req = Some(feedback_req);
                             }
+
+                            if turn_ended
+                                && current_req.is_none()
+                                && let Some(tracker) = &background_tasks
+                            {
+                                let live = tracker.live_tasks(|pid| {
+                                    agent_pid.is_some_and(|agent| {
+                                        workspace_utils::process::is_live_descendant(pid, agent)
+                                    })
+                                });
+                                match wait_policy.after_turn(live, tracker.take_turn_tool_calls()) {
+                                    AfterTurn::Finish => {}
+                                    AfterTurn::Wait(tasks) => {
+                                        client_feedback_handle.record_event(AcpEvent::Notice(
+                                            background_tasks::waiting_notice(&tasks),
+                                        ));
+                                        current_req = Some(proto::PromptRequest::new(
+                                            proto::SessionId::new(acp_session_id.clone()),
+                                            vec![proto::ContentBlock::Text(
+                                                proto::TextContent::new(
+                                                    background_tasks::wait_prompt(&tasks),
+                                                ),
+                                            )],
+                                        ));
+                                    }
+                                    AfterTurn::GiveUp(tasks) => {
+                                        client_feedback_handle.record_event(AcpEvent::Notice(
+                                            background_tasks::give_up_notice(&tasks),
+                                        ));
+                                    }
+                                }
+                            }
+                        }
+
+                        // Cancel session work before cleanup so the agent cannot keep
+                        // starting background tasks while their process groups are stopped.
+                        let _ = conn
+                            .cancel(proto::CancelNotification::new(proto::SessionId::new(
+                                acp_session_id,
+                            )))
+                            .await;
+
+                        if let Some(tracker) = &background_tasks {
+                            background_tasks::stop_background_tasks(tracker, agent_pid).await;
                         }
 
                         // Notify container of completion
                         if let Some(tx) = exit_signal_tx.take() {
                             let _ = tx.send(ExecutorExitResult::Success);
                         }
-
-                        // Cancel session work
-                        let _ = conn
-                            .cancel(proto::CancelNotification::new(proto::SessionId::new(
-                                acp_session_id,
-                            )))
-                            .await;
 
                         // Cleanup
                         drop(conn);

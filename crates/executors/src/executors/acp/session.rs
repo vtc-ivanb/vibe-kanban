@@ -128,6 +128,7 @@ impl SessionManager {
         match event {
             AcpEvent::SessionStart(..)
             | AcpEvent::Error(..)
+            | AcpEvent::Notice(..)
             | AcpEvent::Done(..)
             | AcpEvent::Other(..) => return None,
 

@@ -85,6 +85,18 @@ pub fn normalize_logs_with_suppressed_stderr_patterns(
                         };
                         msg_store.push_patch(ConversationPatch::add_normalized_entry(idx, entry));
                     }
+                    AcpEvent::Notice(msg) => {
+                        streaming.assistant_text = None;
+                        streaming.thinking_text = None;
+                        let idx = entry_index.next();
+                        let entry = NormalizedEntry {
+                            timestamp: None,
+                            entry_type: NormalizedEntryType::SystemMessage,
+                            content: msg,
+                            metadata: None,
+                        };
+                        msg_store.push_patch(ConversationPatch::add_normalized_entry(idx, entry));
+                    }
                     AcpEvent::Done(_) => {
                         streaming.assistant_text = None;
                         streaming.thinking_text = None;
