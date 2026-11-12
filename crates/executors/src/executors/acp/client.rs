@@ -1,8 +1,11 @@
-use std::sync::Arc;
+use std::sync::{
+    Arc,
+    atomic::{AtomicBool, AtomicUsize, Ordering},
+};
 
 use agent_client_protocol::{self as acp};
 use async_trait::async_trait;
-use tokio::sync::{Mutex, mpsc};
+use tokio::sync::{Mutex, Notify, mpsc};
 use tokio_util::sync::CancellationToken;
 use tracing::{debug, warn};
 use workspace_utils::approvals::ApprovalStatus;
@@ -19,6 +22,9 @@ pub struct AcpClient {
     approvals: Option<Arc<dyn ExecutorApprovalService>>,
     feedback_queue: Arc<Mutex<Vec<String>>>,
     cancel: CancellationToken,
+    replaying_history: Arc<AtomicBool>,
+    replayed_notifications: Arc<AtomicUsize>,
+    replay_notification_processed: Arc<Notify>,
 }
 
 impl AcpClient {
@@ -33,6 +39,19 @@ impl AcpClient {
             approvals,
             feedback_queue: Arc::new(Mutex::new(Vec::new())),
             cancel,
+            replaying_history: Arc::new(AtomicBool::new(false)),
+            replayed_notifications: Arc::new(AtomicUsize::new(0)),
+            replay_notification_processed: Arc::new(Notify::new()),
+        }
+    }
+
+    pub fn set_history_replay(&self, replaying: bool) {
+        self.replaying_history.store(replaying, Ordering::Release);
+    }
+
+    pub async fn wait_for_replayed_notifications(&self, expected: usize) {
+        while self.replayed_notifications.load(Ordering::Acquire) < expected {
+            self.replay_notification_processed.notified().await;
         }
     }
 
@@ -177,6 +196,12 @@ impl acp::Client for AcpClient {
     }
 
     async fn session_notification(&self, args: acp::SessionNotification) -> Result<(), acp::Error> {
+        if self.replaying_history.load(Ordering::Acquire) {
+            self.replayed_notifications.fetch_add(1, Ordering::AcqRel);
+            self.replay_notification_processed.notify_one();
+            return Ok(());
+        }
+
         // Convert to typed events
         let event = match args.update {
             acp::SessionUpdate::AgentMessageChunk(chunk) => Some(AcpEvent::Message(chunk.content)),
@@ -277,5 +302,40 @@ impl AcpClient {
             }));
             Err(acp::Error::internal_error())
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn notification(text: &str) -> acp::SessionNotification {
+        acp::SessionNotification::new(
+            "session",
+            acp::SessionUpdate::AgentMessageChunk(acp::ContentChunk::new(acp::ContentBlock::Text(
+                acp::TextContent::new(text),
+            ))),
+        )
+    }
+
+    #[tokio::test]
+    async fn replayed_history_is_not_forwarded_again() {
+        let (event_tx, mut event_rx) = mpsc::unbounded_channel();
+        let client = AcpClient::new(event_tx, None, CancellationToken::new());
+
+        client.set_history_replay(true);
+        acp::Client::session_notification(&client, notification("old"))
+            .await
+            .unwrap();
+        assert!(event_rx.try_recv().is_err());
+
+        client.set_history_replay(false);
+        acp::Client::session_notification(&client, notification("new"))
+            .await
+            .unwrap();
+        assert!(matches!(
+            event_rx.recv().await,
+            Some(AcpEvent::Message(acp::ContentBlock::Text(content))) if content.text == "new"
+        ));
     }
 }

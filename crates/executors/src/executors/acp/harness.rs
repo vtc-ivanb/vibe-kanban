@@ -9,7 +9,11 @@ use agent_client_protocol as proto;
 use agent_client_protocol::Agent as _;
 use command_group::AsyncGroupChild;
 use futures::StreamExt;
-use tokio::{io::AsyncWriteExt, process::Command, sync::mpsc};
+use tokio::{
+    io::{AsyncBufReadExt, AsyncWriteExt, BufReader},
+    process::Command,
+    sync::mpsc,
+};
 use tokio_util::{
     compat::{TokioAsyncReadCompatExt, TokioAsyncWriteCompatExt},
     io::ReaderStream,
@@ -115,6 +119,7 @@ impl AcpAgentHarness {
             &mut child,
             current_dir.to_path_buf(),
             None,
+            None,
             prompt,
             Some(exit_tx),
             self.session_namespace.clone(),
@@ -138,6 +143,7 @@ impl AcpAgentHarness {
         current_dir: &Path,
         prompt: String,
         session_id: &str,
+        reset_to_message_id: Option<&str>,
         command_parts: CommandParts,
         env: &ExecutionEnv,
         cmd_overrides: &CmdOverrides,
@@ -168,6 +174,7 @@ impl AcpAgentHarness {
             &mut child,
             current_dir.to_path_buf(),
             Some(session_id.to_string()),
+            reset_to_message_id.map(str::to_string),
             prompt,
             Some(exit_tx),
             self.session_namespace.clone(),
@@ -190,6 +197,7 @@ impl AcpAgentHarness {
         child: &mut AsyncGroupChild,
         cwd: PathBuf,
         existing_session: Option<String>,
+        reset_to_message_id: Option<String>,
         prompt: String,
         exit_signal: Option<tokio::sync::oneshot::Sender<ExecutorExitResult>>,
         session_namespace: String,
@@ -232,16 +240,22 @@ impl AcpAgentHarness {
         let (shutdown_tx, shutdown_rx) = tokio::sync::watch::channel(false);
 
         // Process stdout -> ACP
+        let replay_tracker = Arc::new(ProtocolReplayTracker::default());
+        let stdout_replay_tracker = replay_tracker.clone();
         let stdout_shutdown_rx = shutdown_rx.clone();
         tokio::spawn(async move {
-            let mut stdout_stream = ReaderStream::new(orig_stdout);
-            while let Some(res) = stdout_stream.next().await {
+            let mut stdout = BufReader::new(orig_stdout);
+            let mut line = String::new();
+            loop {
                 if *stdout_shutdown_rx.borrow() {
                     break;
                 }
-                match res {
-                    Ok(data) => {
-                        let _ = to_acp_writer.write_all(&data).await;
+                line.clear();
+                match stdout.read_line(&mut line).await {
+                    Ok(0) => break,
+                    Ok(_) => {
+                        stdout_replay_tracker.record(&line);
+                        let _ = to_acp_writer.write_all(line.as_bytes()).await;
                     }
                     Err(_) => break,
                 }
@@ -330,70 +344,50 @@ impl AcpAgentHarness {
                             let _ = io_fut.await;
                         });
 
-                        // Initialize
-                        if let Err(e) = conn
+                        let initialize_response = match conn
                             .initialize(proto::InitializeRequest::new(proto::ProtocolVersion::V1))
                             .await
                         {
-                            report_startup_failure(&log_tx, &mut exit_signal_tx, "initialize", &e);
-                            return;
-                        }
+                            Ok(response) => response,
+                            Err(e) => {
+                                report_startup_failure(
+                                    &log_tx,
+                                    &mut exit_signal_tx,
+                                    "initialize",
+                                    &e,
+                                );
+                                return;
+                            }
+                        };
 
-                        // Handle session creation/forking
-                        let (acp_session_id, display_session_id, prompt_to_send) =
-                            if let Some(existing) = existing_session {
-                                // Fork existing session
-                                let new_ui_id = uuid::Uuid::new_v4().to_string();
-                                let _ = session_manager.fork_session(&existing, &new_ui_id);
-
-                                let history = session_manager.read_session_raw(&new_ui_id).ok();
-                                let meta =
-                                    history.map(|h| serde_json::json!({ "history_jsonl": h }));
-
-                                let mut req = proto::NewSessionRequest::new(cwd.clone());
-                                if let Some(m) = meta
-                                    && let Some(obj) = m.as_object()
-                                {
-                                    req = req.meta(obj.clone());
-                                }
-                                match conn.new_session(req).await {
-                                    Ok(resp) => {
-                                        let resume_prompt = session_manager
-                                            .generate_resume_prompt(&new_ui_id, &prompt)
-                                            .unwrap_or_else(|_| prompt.clone());
-                                        (resp.session_id.0.to_string(), new_ui_id, resume_prompt)
-                                    }
-                                    Err(e) => {
-                                        report_startup_failure(
-                                            &log_tx,
-                                            &mut exit_signal_tx,
-                                            "create session",
-                                            &e,
-                                        );
-                                        return;
-                                    }
-                                }
-                            } else {
-                                // New session
-                                match conn
-                                    .new_session(proto::NewSessionRequest::new(cwd.clone()))
-                                    .await
-                                {
-                                    Ok(resp) => {
-                                        let sid = resp.session_id.0.to_string();
-                                        (sid.clone(), sid, prompt)
-                                    }
-                                    Err(e) => {
-                                        report_startup_failure(
-                                            &log_tx,
-                                            &mut exit_signal_tx,
-                                            "create session",
-                                            &e,
-                                        );
-                                        return;
-                                    }
-                                }
-                            };
+                        let SessionSetup {
+                            acp_session_id,
+                            display_session_id,
+                            prompt_to_send,
+                        } = match establish_session(
+                            &conn,
+                            &session_manager,
+                            &cwd,
+                            existing_session,
+                            reset_to_message_id.as_deref(),
+                            &prompt,
+                            initialize_response.agent_capabilities.load_session,
+                            Some(replay_tracker),
+                            &client_feedback_handle,
+                        )
+                        .await
+                        {
+                            Ok(session) => session,
+                            Err(e) => {
+                                report_startup_failure(
+                                    &log_tx,
+                                    &mut exit_signal_tx,
+                                    "create session",
+                                    &e,
+                                );
+                                return;
+                            }
+                        };
 
                         // Emit session ID
                         let _ = log_tx
@@ -455,13 +449,6 @@ impl AcpAgentHarness {
                                 let _ = sm_for_writer.append_raw_line(&sess_id_for_writer, &line);
                             }
                         });
-
-                        // Save prompt to session
-                        let _ = session_manager.append_raw_line(
-                            &display_session_id,
-                            &serde_json::to_string(&serde_json::json!({ "user": prompt_to_send }))
-                                .unwrap_or_default(),
-                        );
 
                         // Build prompt request
                         let initial_req = proto::PromptRequest::new(
@@ -558,6 +545,203 @@ impl AcpAgentHarness {
     }
 }
 
+struct SessionSetup {
+    acp_session_id: String,
+    display_session_id: String,
+    prompt_to_send: String,
+}
+
+#[derive(Default)]
+struct ReplayProtocolState {
+    active: bool,
+    response_received: bool,
+    replayed: usize,
+}
+
+#[derive(Default)]
+struct ProtocolReplayTracker {
+    state: std::sync::Mutex<ReplayProtocolState>,
+    response_received: tokio::sync::Notify,
+}
+
+impl ProtocolReplayTracker {
+    fn start(&self) {
+        let mut state = self.state.lock().unwrap();
+        state.active = true;
+        state.response_received = false;
+        state.replayed = 0;
+    }
+
+    fn record(&self, line: &str) {
+        let Ok(message) = serde_json::from_str::<serde_json::Value>(line) else {
+            return;
+        };
+        let is_response = message.get("id").is_some() && message.get("method").is_none();
+        let is_session_update = message.get("method").and_then(|m| m.as_str())
+            == Some("session/update")
+            && message.get("params").is_some_and(|params| {
+                serde_json::from_value::<proto::SessionNotification>(params.clone()).is_ok()
+            });
+
+        let mut state = self.state.lock().unwrap();
+        if !state.active {
+            return;
+        }
+        if is_session_update {
+            state.replayed += 1;
+        }
+        if is_response {
+            state.active = false;
+            state.response_received = true;
+            self.response_received.notify_one();
+        }
+    }
+
+    fn replayed_after_response(&self) -> Option<usize> {
+        let state = self.state.lock().unwrap();
+        state.response_received.then_some(state.replayed)
+    }
+
+    async fn wait_for_response(&self) -> usize {
+        loop {
+            if let Some(replayed) = self.replayed_after_response() {
+                return replayed;
+            }
+            self.response_received.notified().await;
+        }
+    }
+}
+
+struct HistoryReplayGuard {
+    client: AcpClient,
+    tracker: Option<Arc<ProtocolReplayTracker>>,
+}
+
+impl HistoryReplayGuard {
+    fn start(client: &AcpClient, tracker: Option<Arc<ProtocolReplayTracker>>) -> Self {
+        client.set_history_replay(true);
+        if let Some(tracker) = &tracker {
+            tracker.start();
+        }
+        Self {
+            client: client.clone(),
+            tracker,
+        }
+    }
+
+    async fn finish<T>(self, result: Result<T, proto::Error>) -> Result<T, proto::Error> {
+        let expected = match self.tracker {
+            Some(tracker) if result.is_ok() => tracker.wait_for_response().await,
+            Some(tracker) => tracker.replayed_after_response().unwrap_or(0),
+            None => 0,
+        };
+        self.client.wait_for_replayed_notifications(expected).await;
+        self.client.set_history_replay(false);
+        result
+    }
+}
+
+async fn establish_session(
+    conn: &impl proto::Agent,
+    session_manager: &SessionManager,
+    cwd: &Path,
+    existing_session: Option<String>,
+    reset_to_message_id: Option<&str>,
+    prompt: &str,
+    native_resume_supported: bool,
+    replay_tracker: Option<Arc<ProtocolReplayTracker>>,
+    client: &AcpClient,
+) -> Result<SessionSetup, proto::Error> {
+    if let Some(existing) = existing_session {
+        let checkpoint = reset_to_message_id.unwrap_or(&existing);
+        let display_session_id = uuid::Uuid::new_v4().to_string();
+        if let Err(e) = session_manager.fork_session(checkpoint, &display_session_id) {
+            tracing::warn!("Failed to snapshot ACP session history: {e}");
+        }
+
+        let native_session = if native_resume_supported && reset_to_message_id.is_none() {
+            match session_manager.native_session_id(&existing) {
+                Ok(native_id) => {
+                    match session_manager.native_session_is_current(&existing, &native_id) {
+                        Ok(true) => Some(native_id),
+                        Ok(false) => None,
+                        Err(e) => {
+                            tracing::warn!("Failed to resolve native ACP session head: {e}");
+                            None
+                        }
+                    }
+                }
+                Err(e) => {
+                    tracing::warn!("Failed to resolve native ACP session ID: {e}");
+                    None
+                }
+            }
+        } else {
+            None
+        };
+
+        if let Some(native_id) = native_session {
+            let replay = HistoryReplayGuard::start(client, replay_tracker);
+            let result = conn
+                .load_session(proto::LoadSessionRequest::new(
+                    native_id.clone(),
+                    cwd.to_path_buf(),
+                ))
+                .await;
+
+            match replay.finish(result).await {
+                Ok(_) => {
+                    if let Err(e) =
+                        session_manager.set_native_session_id(&display_session_id, &native_id)
+                    {
+                        tracing::warn!("Failed to save native ACP session mapping: {e}");
+                    }
+                    return Ok(SessionSetup {
+                        acp_session_id: native_id,
+                        display_session_id,
+                        prompt_to_send: prompt.to_string(),
+                    });
+                }
+                Err(e) => {
+                    tracing::warn!(
+                        "Failed to load native ACP session {native_id}: {e}; falling back to reconstructed history"
+                    );
+                }
+            }
+        }
+
+        let prompt_to_send = session_manager
+            .generate_resume_prompt(checkpoint, prompt)
+            .unwrap_or_else(|e| {
+                tracing::warn!("Failed to reconstruct ACP session history: {e}");
+                prompt.to_string()
+            });
+        let response = conn
+            .new_session(proto::NewSessionRequest::new(cwd.to_path_buf()))
+            .await?;
+        let native_id = response.session_id.0.to_string();
+        if let Err(e) = session_manager.set_native_session_id(&display_session_id, &native_id) {
+            tracing::warn!("Failed to save native ACP session mapping: {e}");
+        }
+
+        return Ok(SessionSetup {
+            acp_session_id: native_id,
+            display_session_id,
+            prompt_to_send,
+        });
+    }
+
+    let response = conn
+        .new_session(proto::NewSessionRequest::new(cwd.to_path_buf()))
+        .await?;
+    let session_id = response.session_id.0.to_string();
+    Ok(SessionSetup {
+        acp_session_id: session_id.clone(),
+        display_session_id: session_id,
+        prompt_to_send: prompt.to_string(),
+    })
+}
+
 fn report_startup_failure(
     log_tx: &mpsc::UnboundedSender<String>,
     exit_signal: &mut Option<tokio::sync::oneshot::Sender<ExecutorExitResult>>,
@@ -574,7 +758,385 @@ fn report_startup_failure(
 
 #[cfg(test)]
 mod tests {
+    use std::sync::Mutex;
+
     use super::*;
+
+    #[derive(Default)]
+    struct FakeAgent {
+        new_session_requests: Mutex<Vec<proto::NewSessionRequest>>,
+        load_session_requests: Mutex<Vec<proto::LoadSessionRequest>>,
+        fail_load: bool,
+    }
+
+    #[async_trait::async_trait(?Send)]
+    impl proto::Agent for FakeAgent {
+        async fn initialize(
+            &self,
+            args: proto::InitializeRequest,
+        ) -> Result<proto::InitializeResponse, proto::Error> {
+            Ok(proto::InitializeResponse::new(args.protocol_version))
+        }
+
+        async fn authenticate(
+            &self,
+            _args: proto::AuthenticateRequest,
+        ) -> Result<proto::AuthenticateResponse, proto::Error> {
+            Ok(proto::AuthenticateResponse::default())
+        }
+
+        async fn new_session(
+            &self,
+            args: proto::NewSessionRequest,
+        ) -> Result<proto::NewSessionResponse, proto::Error> {
+            self.new_session_requests.lock().unwrap().push(args);
+            Ok(proto::NewSessionResponse::new("fallback-native-id"))
+        }
+
+        async fn load_session(
+            &self,
+            args: proto::LoadSessionRequest,
+        ) -> Result<proto::LoadSessionResponse, proto::Error> {
+            self.load_session_requests.lock().unwrap().push(args);
+            if self.fail_load {
+                Err(proto::Error::invalid_request())
+            } else {
+                Ok(proto::LoadSessionResponse::new())
+            }
+        }
+
+        async fn prompt(
+            &self,
+            _args: proto::PromptRequest,
+        ) -> Result<proto::PromptResponse, proto::Error> {
+            Ok(proto::PromptResponse::new(proto::StopReason::EndTurn))
+        }
+
+        async fn cancel(&self, _args: proto::CancelNotification) -> Result<(), proto::Error> {
+            Ok(())
+        }
+    }
+
+    struct TestManager {
+        dir: PathBuf,
+        manager: SessionManager,
+    }
+
+    impl TestManager {
+        fn new() -> Self {
+            let dir = std::env::temp_dir().join(format!(
+                "vibe-kanban-acp-harness-test-{}",
+                uuid::Uuid::new_v4()
+            ));
+            let manager = SessionManager::with_base_dir(dir.clone()).unwrap();
+            Self { dir, manager }
+        }
+
+        fn add_history(&self, session_id: &str) {
+            self.manager
+                .append_raw_line(
+                    session_id,
+                    &AcpEvent::User("earlier request".into()).to_string(),
+                )
+                .unwrap();
+            self.manager
+                .append_raw_line(
+                    session_id,
+                    &AcpEvent::Message(proto::ContentBlock::Text(proto::TextContent::new(
+                        "earlier response",
+                    )))
+                    .to_string(),
+                )
+                .unwrap();
+        }
+    }
+
+    impl Drop for TestManager {
+        fn drop(&mut self) {
+            let _ = std::fs::remove_dir_all(&self.dir);
+        }
+    }
+
+    fn client() -> AcpClient {
+        let (event_tx, _event_rx) = mpsc::unbounded_channel();
+        AcpClient::new(event_tx, None, CancellationToken::new())
+    }
+
+    async fn establish(
+        agent: &FakeAgent,
+        manager: &SessionManager,
+        native_resume_supported: bool,
+    ) -> SessionSetup {
+        establish_from(agent, manager, "previous", None, native_resume_supported).await
+    }
+
+    async fn establish_from(
+        agent: &FakeAgent,
+        manager: &SessionManager,
+        existing: &str,
+        reset_to_message_id: Option<&str>,
+        native_resume_supported: bool,
+    ) -> SessionSetup {
+        establish_session(
+            agent,
+            manager,
+            Path::new("/tmp/workspace"),
+            Some(existing.to_string()),
+            reset_to_message_id,
+            "continue",
+            native_resume_supported,
+            None,
+            &client(),
+        )
+        .await
+        .unwrap()
+    }
+
+    #[tokio::test]
+    async fn native_resume_loads_existing_session_without_reconstructed_history() {
+        let agent = FakeAgent::default();
+        let test = TestManager::new();
+        test.add_history("previous");
+        let original = test.manager.read_session_raw("previous").unwrap();
+
+        let setup = establish(&agent, &test.manager, true).await;
+
+        assert_eq!(setup.acp_session_id, "previous");
+        assert_ne!(setup.display_session_id, "previous");
+        assert_eq!(setup.prompt_to_send, "continue");
+        assert!(agent.new_session_requests.lock().unwrap().is_empty());
+        let loads = agent.load_session_requests.lock().unwrap();
+        assert_eq!(loads.len(), 1);
+        assert_eq!(loads[0].session_id.0.as_ref(), "previous");
+        assert_eq!(loads[0].cwd, Path::new("/tmp/workspace"));
+        assert_eq!(test.manager.read_session_raw("previous").unwrap(), original);
+        assert_eq!(
+            test.manager
+                .read_session_raw(&setup.display_session_id)
+                .unwrap(),
+            original
+        );
+        assert_eq!(
+            test.manager
+                .native_session_id(&setup.display_session_id)
+                .unwrap(),
+            "previous"
+        );
+    }
+
+    #[tokio::test]
+    async fn fallback_sends_history_once_and_preserves_native_session_id() {
+        let agent = FakeAgent::default();
+        let test = TestManager::new();
+        test.add_history("previous");
+
+        let setup = establish(&agent, &test.manager, false).await;
+
+        assert_eq!(setup.acp_session_id, "fallback-native-id");
+        assert_ne!(setup.display_session_id, "fallback-native-id");
+        assert_eq!(setup.prompt_to_send.matches("earlier request").count(), 1);
+        assert_eq!(setup.prompt_to_send.matches("earlier response").count(), 1);
+        assert_eq!(
+            setup
+                .prompt_to_send
+                .matches("=== CURRENT REQUEST ===")
+                .count(),
+            1
+        );
+        assert!(agent.load_session_requests.lock().unwrap().is_empty());
+        let requests = agent.new_session_requests.lock().unwrap();
+        assert_eq!(requests.len(), 1);
+        assert!(requests[0].meta.is_none());
+        let copied = test
+            .manager
+            .read_resume_history(&setup.display_session_id)
+            .unwrap();
+        assert!(copied.contains("earlier request"));
+        assert!(copied.contains("earlier response"));
+        assert_eq!(
+            test.manager
+                .native_session_id(&setup.display_session_id)
+                .unwrap(),
+            "fallback-native-id"
+        );
+    }
+
+    #[tokio::test]
+    async fn failed_native_load_uses_single_history_fallback() {
+        let agent = FakeAgent {
+            fail_load: true,
+            ..Default::default()
+        };
+        let test = TestManager::new();
+        test.add_history("previous");
+
+        let setup = establish(&agent, &test.manager, true).await;
+
+        assert_ne!(setup.display_session_id, "fallback-native-id");
+        assert_eq!(setup.prompt_to_send.matches("earlier request").count(), 1);
+        assert_eq!(agent.load_session_requests.lock().unwrap().len(), 1);
+        let requests = agent.new_session_requests.lock().unwrap();
+        assert_eq!(requests.len(), 1);
+        assert!(requests[0].meta.is_none());
+    }
+
+    #[tokio::test]
+    async fn retry_reconstructs_from_checkpoint_instead_of_native_history() {
+        let agent = FakeAgent::default();
+        let test = TestManager::new();
+        test.add_history("previous");
+
+        let setup = establish_from(&agent, &test.manager, "previous", Some("previous"), true).await;
+
+        assert_eq!(setup.acp_session_id, "fallback-native-id");
+        assert_ne!(setup.display_session_id, "previous");
+        assert_eq!(setup.prompt_to_send.matches("earlier request").count(), 1);
+        assert_eq!(setup.prompt_to_send.matches("earlier response").count(), 1);
+        assert!(
+            setup
+                .prompt_to_send
+                .contains("=== CURRENT REQUEST ===\ncontinue")
+        );
+        assert!(agent.load_session_requests.lock().unwrap().is_empty());
+        assert_eq!(agent.new_session_requests.lock().unwrap().len(), 1);
+        assert_eq!(
+            test.manager
+                .native_session_id(&setup.display_session_id)
+                .unwrap(),
+            "fallback-native-id"
+        );
+    }
+
+    #[tokio::test]
+    async fn older_checkpoint_after_standalone_reset_skips_native_resume() {
+        let agent = FakeAgent::default();
+        let test = TestManager::new();
+        test.add_history("retained");
+        test.add_history("latest");
+        test.manager
+            .set_native_session_id("retained", "native")
+            .unwrap();
+        test.manager
+            .set_native_session_id("latest", "native")
+            .unwrap();
+
+        let setup = establish_from(&agent, &test.manager, "retained", None, true).await;
+
+        assert_eq!(setup.acp_session_id, "fallback-native-id");
+        assert!(setup.prompt_to_send.contains("=== CURRENT REQUEST ==="));
+        assert!(agent.load_session_requests.lock().unwrap().is_empty());
+        assert_eq!(agent.new_session_requests.lock().unwrap().len(), 1);
+    }
+
+    #[test]
+    fn replay_tracker_ignores_notifications_acp_rejects() {
+        let tracker = ProtocolReplayTracker::default();
+        tracker.start();
+        tracker.record(
+            r#"{"method":"session/update","params":{"sessionId":"previous","update":{"sessionUpdate":"agentMessageChunk","content":{"type":"text","text":"invalid"}}}}"#,
+        );
+        tracker.record(
+            r#"{"method":"session/update","params":{"sessionId":"previous","update":{"sessionUpdate":"agent_message_chunk","content":{"type":"text","text":"valid"}}}}"#,
+        );
+        tracker.record(r#"{"id":0,"result":null}"#);
+
+        assert_eq!(tracker.replayed_after_response(), Some(1));
+    }
+
+    #[tokio::test]
+    async fn native_resume_drains_queued_history_before_live_notifications() {
+        use tokio::io::{AsyncBufReadExt, BufReader};
+
+        tokio::task::LocalSet::new()
+            .run_until(async {
+                let (event_tx, mut event_rx) = mpsc::unbounded_channel();
+                let client = AcpClient::new(event_tx, None, CancellationToken::new());
+                let tracker = Arc::new(ProtocolReplayTracker::default());
+                let agent_tracker = tracker.clone();
+                let (client_stream, agent_stream) = tokio::io::duplex(4096);
+                let (client_read, client_write) = tokio::io::split(client_stream);
+                let (conn, io) = proto::ClientSideConnection::new(
+                    client.clone(),
+                    client_write.compat_write(),
+                    client_read.compat(),
+                    |fut| {
+                        tokio::task::spawn_local(fut);
+                    },
+                );
+                let io_handle = tokio::task::spawn_local(io);
+                let agent_handle = tokio::task::spawn_local(async move {
+                    let mut agent_stream = BufReader::new(agent_stream);
+                    let mut request = String::new();
+                    agent_stream.read_line(&mut request).await.unwrap();
+                    let request: serde_json::Value = serde_json::from_str(&request).unwrap();
+                    let mut payload = (0..100)
+                        .map(|index| {
+                            serde_json::json!({
+                                "jsonrpc": "2.0",
+                                "method": "session/update",
+                                "params": {
+                                    "sessionId": "previous",
+                                    "update": {
+                                        "sessionUpdate": "agent_message_chunk",
+                                        "content": { "type": "text", "text": format!("old {index}") }
+                                    }
+                                }
+                            })
+                            .to_string()
+                        })
+                        .collect::<Vec<_>>()
+                        .join("\n");
+                    let response = serde_json::json!({
+                        "jsonrpc": "2.0",
+                        "id": request["id"],
+                        "result": null
+                    });
+                    payload.push_str(&format!("\n{response}\n"));
+                    for line in payload.lines() {
+                        agent_tracker.record(line);
+                    }
+                    agent_stream
+                        .get_mut()
+                        .write_all(payload.as_bytes())
+                        .await
+                        .unwrap();
+                });
+
+                let replay = HistoryReplayGuard::start(&client, Some(tracker));
+                let result = conn
+                    .load_session(proto::LoadSessionRequest::new(
+                        "previous",
+                        Path::new("/tmp/workspace"),
+                    ))
+                    .await;
+                tokio::time::timeout(std::time::Duration::from_secs(10), replay.finish(result))
+                    .await
+                    .expect("replay drain timed out")
+                    .unwrap();
+
+                assert!(event_rx.try_recv().is_err());
+                proto::Client::session_notification(
+                    &client,
+                    proto::SessionNotification::new(
+                        "previous",
+                        proto::SessionUpdate::AgentMessageChunk(proto::ContentChunk::new(
+                            proto::ContentBlock::Text(proto::TextContent::new("new")),
+                        )),
+                    ),
+                )
+                .await
+                .unwrap();
+                assert!(matches!(
+                    event_rx.recv().await,
+                    Some(AcpEvent::Message(proto::ContentBlock::Text(content))) if content.text == "new"
+                ));
+
+                drop(conn);
+                agent_handle.abort();
+                io_handle.abort();
+            })
+            .await;
+    }
 
     #[tokio::test]
     async fn startup_failures_are_visible_and_fail_the_execution() {

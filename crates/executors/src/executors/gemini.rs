@@ -112,7 +112,7 @@ impl StandardCodingAgentExecutor for Gemini {
         current_dir: &Path,
         prompt: &str,
         session_id: &str,
-        _reset_to_message_id: Option<&str>,
+        reset_to_message_id: Option<&str>,
         env: &ExecutionEnv,
     ) -> Result<SpawnedChild, ExecutorError> {
         let harness = AcpAgentHarness::new();
@@ -128,6 +128,7 @@ impl StandardCodingAgentExecutor for Gemini {
                 current_dir,
                 combined_prompt,
                 session_id,
+                reset_to_message_id,
                 gemini_command,
                 env,
                 &self.cmd,

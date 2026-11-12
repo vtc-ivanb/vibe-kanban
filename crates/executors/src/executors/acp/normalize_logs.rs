@@ -68,7 +68,8 @@ pub fn normalize_logs_with_suppressed_stderr_patterns(
                 match parsed {
                     AcpEvent::SessionStart(id) => {
                         if !stored_session_id {
-                            msg_store.push_session_id(id);
+                            msg_store.push_session_id(id.clone());
+                            msg_store.push_message_id(id);
                             stored_session_id = true;
                         }
                     }
@@ -865,4 +866,37 @@ struct EditInput {
     old_string: Option<String>,
     #[serde(default)]
     new_string: Option<String>,
+}
+
+#[cfg(test)]
+mod tests {
+    use workspace_utils::{log_msg::LogMsg, msg_store::MsgStore};
+
+    use super::*;
+
+    #[tokio::test]
+    async fn session_start_emits_retry_checkpoint_ids() {
+        let msg_store = Arc::new(MsgStore::new());
+        msg_store.push_stdout(format!(
+            "{}\n",
+            AcpEvent::SessionStart("checkpoint".to_string())
+        ));
+        msg_store.push_finished();
+
+        for handle in normalize_logs(msg_store.clone(), Path::new("/tmp/test-worktree")) {
+            handle.await.unwrap();
+        }
+
+        let history = msg_store.get_history();
+        assert!(
+            history
+                .iter()
+                .any(|msg| matches!(msg, LogMsg::SessionId(id) if id == "checkpoint"))
+        );
+        assert!(
+            history
+                .iter()
+                .any(|msg| matches!(msg, LogMsg::MessageId(id) if id == "checkpoint"))
+        );
+    }
 }

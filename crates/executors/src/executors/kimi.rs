@@ -177,7 +177,7 @@ impl StandardCodingAgentExecutor for KimiCode {
         current_dir: &Path,
         prompt: &str,
         session_id: &str,
-        _reset_to_message_id: Option<&str>,
+        reset_to_message_id: Option<&str>,
         env: &ExecutionEnv,
     ) -> Result<SpawnedChild, ExecutorError> {
         self.harness()
@@ -185,6 +185,7 @@ impl StandardCodingAgentExecutor for KimiCode {
                 current_dir,
                 self.append_prompt.combine_prompt(prompt),
                 session_id,
+                reset_to_message_id,
                 self.build_command_builder()?.build_follow_up(&[])?,
                 env,
                 &self.cmd,

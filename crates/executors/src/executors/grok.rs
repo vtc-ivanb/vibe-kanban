@@ -155,7 +155,7 @@ impl StandardCodingAgentExecutor for Grok {
         current_dir: &Path,
         prompt: &str,
         session_id: &str,
-        _reset_to_message_id: Option<&str>,
+        reset_to_message_id: Option<&str>,
         env: &ExecutionEnv,
     ) -> Result<SpawnedChild, ExecutorError> {
         let grok_command = self.build_command_builder()?.build_follow_up(&[])?;
@@ -165,6 +165,7 @@ impl StandardCodingAgentExecutor for Grok {
                 current_dir,
                 combined_prompt,
                 session_id,
+                reset_to_message_id,
                 grok_command,
                 &execution_env(env),
                 &self.cmd,
