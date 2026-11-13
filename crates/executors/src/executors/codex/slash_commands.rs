@@ -277,6 +277,7 @@ impl Codex {
                 Err(message) => EventMsg::Error(ErrorEvent {
                     message,
                     codex_error_info: None,
+                    rejected_audio_file_ids: Vec::new(),
                     misalignment: None,
                 }),
             }],

@@ -2219,6 +2219,8 @@ pub fn normalize_logs(
                 EventMsg::Error(ErrorEvent {
                     message,
                     codex_error_info,
+                    // Host-only; nothing to show in the UI.
+                    rejected_audio_file_ids: _,
                     // Never deserialized from the wire: the field is `serde(skip)`.
                     misalignment: _,
                 }) => {
@@ -2432,7 +2434,8 @@ pub fn normalize_logs(
                 | EventMsg::AuthRecoveryStarted(..)
                 | EventMsg::AuthRecoveryCompleted(..)
                 | EventMsg::ElicitationAbandoned(..)
-                | EventMsg::PrivateSessionEvent(..) => {}
+                | EventMsg::PrivateSessionEvent(..)
+                | EventMsg::NetworkApprovalResolved { .. } => {}
             }
         }
     });
