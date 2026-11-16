@@ -2,7 +2,8 @@ use std::{
     path::{Path, PathBuf},
     process::Stdio,
     rc::Rc,
-    sync::Arc,
+    sync::{Arc, atomic::Ordering},
+    time::Duration,
 };
 
 use agent_client_protocol as proto;
@@ -41,6 +42,7 @@ pub struct AcpAgentHarness {
     model: Option<String>,
     mode: Option<String>,
     wait_for_background_tasks: bool,
+    retry_unanswered_prompts: bool,
 }
 
 impl Default for AcpAgentHarness {
@@ -58,6 +60,7 @@ impl AcpAgentHarness {
             model: None,
             mode: None,
             wait_for_background_tasks: false,
+            retry_unanswered_prompts: false,
         }
     }
 
@@ -68,6 +71,7 @@ impl AcpAgentHarness {
             model: None,
             mode: None,
             wait_for_background_tasks: false,
+            retry_unanswered_prompts: false,
         }
     }
 
@@ -87,6 +91,14 @@ impl AcpAgentHarness {
     /// takes effect on unix; see [`background_tasks`].
     pub fn with_background_task_wait(mut self) -> Self {
         self.wait_for_background_tasks = true;
+        self
+    }
+
+    /// Resend a prompt the agent answers with `end_turn` without sending a
+    /// single session update, a bounded number of times. See
+    /// [`UNANSWERED_PROMPT_RETRY_DELAYS`].
+    pub fn with_unanswered_prompt_retry(mut self) -> Self {
+        self.retry_unanswered_prompts = true;
         self
     }
 
@@ -141,6 +153,7 @@ impl AcpAgentHarness {
             self.model.clone(),
             self.mode.clone(),
             self.wait_for_background_tasks,
+            self.retry_unanswered_prompts,
             approvals,
             cancel.clone(),
         )
@@ -197,6 +210,7 @@ impl AcpAgentHarness {
             self.model.clone(),
             self.mode.clone(),
             self.wait_for_background_tasks,
+            self.retry_unanswered_prompts,
             approvals,
             cancel.clone(),
         )
@@ -221,6 +235,7 @@ impl AcpAgentHarness {
         model: Option<String>,
         mode: Option<String>,
         wait_for_background_tasks: bool,
+        retry_unanswered_prompts: bool,
         approvals: Option<std::sync::Arc<dyn ExecutorApprovalService>>,
         cancel: CancellationToken,
     ) -> Result<(), ExecutorError> {
@@ -356,7 +371,6 @@ impl AcpAgentHarness {
                         // Create ACP client with approvals support
                         let client =
                             AcpClient::new(event_tx.clone(), approvals.clone(), cancel.clone());
-                        let mut wait_policy = WaitPolicy::default();
                         let client_feedback_handle = client.clone();
 
                         client.record_user_prompt_event(&prompt);
@@ -479,146 +493,25 @@ impl AcpAgentHarness {
                             }
                         });
 
-                        // Build prompt request
-                        let initial_req = proto::PromptRequest::new(
-                            proto::SessionId::new(acp_session_id.clone()),
-                            vec![proto::ContentBlock::Text(proto::TextContent::new(
-                                prompt_to_send,
-                            ))],
-                        );
-
-                        let mut current_req = Some(initial_req);
-
-                        let mut silent_turn_retries = 0;
-                        while let Some(req) = current_req.take() {
-                            if cancel.is_cancelled() {
-                                tracing::debug!("ACP executor cancelled, stopping prompt loop");
-                                break;
-                            }
-
-                            // The protocol resolves responses independently of notification
-                            // handlers. Drain the preceding turn before resetting its state.
-                            tokio::select! {
-                                _ = cancel.cancelled() => break,
-                                _ = client_feedback_handle.drain_notifications(
-                                    replay_tracker.notifications.load(std::sync::atomic::Ordering::Acquire)
-                                ) => {}
-                            }
-                            client_feedback_handle.reset_turn_message();
-                            tracing::trace!(?req, "sending ACP prompt request");
-                            // Send the prompt and await completion to obtain stop_reason
-                            let prompt_result = tokio::select! {
-                                _ = cancel.cancelled() => {
-                                    tracing::debug!("ACP executor cancelled during prompt");
-                                    break;
-                                }
-                                result = conn.prompt(req) => result,
+                        let unanswered_prompt_retry_delays: &[Duration] =
+                            if retry_unanswered_prompts {
+                                &UNANSWERED_PROMPT_RETRY_DELAYS
+                            } else {
+                                &[]
                             };
-
-                            tokio::select! {
-                                _ = cancel.cancelled() => break,
-                                _ = client_feedback_handle.drain_notifications(
-                                    replay_tracker.notifications.load(std::sync::atomic::Ordering::Acquire)
-                                ) => {}
-                            }
-                            let mut turn_ended = false;
-                            let mut background_wait_abandoned = false;
-                            match prompt_result {
-                                Ok(resp) => {
-                                    turn_ended = resp.stop_reason == proto::StopReason::EndTurn;
-                                    // Emit done with stop_reason
-                                    let stop_reason = serde_json::to_string(&resp.stop_reason)
-                                        .unwrap_or_default();
-                                    let _ = log_tx.send(AcpEvent::Done(stop_reason).to_string());
-                                }
-                                Err(e) => {
-                                    tracing::debug!("error {} {e} {:?}", e.code, e.data);
-                                    if e.code
-                                        == agent_client_protocol::ErrorCode::INTERNAL_ERROR.code
-                                        && e.data
-                                            .as_ref()
-                                            .is_some_and(|d| d == "server shut down unexpectedly")
-                                    {
-                                        tracing::debug!("ACP server killed");
-                                    } else {
-                                        let _ = log_tx
-                                            .send(AcpEvent::Error(format!("{e}")).to_string());
-                                    }
-                                }
-                            }
-
-                            // Flush any pending user feedback after finish
-                            let feedback = client_feedback_handle
-                                .drain_feedback()
-                                .await
-                                .join("\n")
-                                .trim()
-                                .to_string();
-                            if !feedback.is_empty() {
-                                tracing::trace!(?feedback, "sending ACP follow-up feedback");
-                                let session_id = proto::SessionId::new(acp_session_id.clone());
-                                let feedback_req = proto::PromptRequest::new(
-                                    session_id.clone(),
-                                    vec![proto::ContentBlock::Text(proto::TextContent::new(
-                                        feedback,
-                                    ))],
-                                );
-                                current_req = Some(feedback_req);
-                            }
-
-                            if turn_ended
-                                && current_req.is_none()
-                                && let Some(tracker) = &background_tasks
-                            {
-                                let live = tracker.live_tasks(|pid| {
-                                    agent_pid.is_some_and(|agent| {
-                                        workspace_utils::process::is_live_descendant(pid, agent)
-                                    })
-                                });
-                                match wait_policy.after_turn(live, tracker.take_turn_tool_calls()) {
-                                    AfterTurn::Finish => {}
-                                    AfterTurn::Wait(tasks) => {
-                                        client_feedback_handle.record_event(AcpEvent::Notice(
-                                            background_tasks::waiting_notice(&tasks),
-                                        ));
-                                        current_req = Some(proto::PromptRequest::new(
-                                            proto::SessionId::new(acp_session_id.clone()),
-                                            vec![proto::ContentBlock::Text(
-                                                proto::TextContent::new(
-                                                    background_tasks::wait_prompt(&tasks),
-                                                ),
-                                            )],
-                                        ));
-                                    }
-                                    AfterTurn::GiveUp(tasks) => {
-                                        background_wait_abandoned = true;
-                                        client_feedback_handle.record_event(AcpEvent::Notice(
-                                            background_tasks::give_up_notice(&tasks),
-                                        ));
-                                    }
-                                }
-                            }
-                            // Some agents end immediately after a tool result without
-                            // reporting the outcome. Give them one bounded recovery turn.
-                            if turn_ended
-                                && current_req.is_none()
-                                && !background_wait_abandoned
-                                && client_feedback_handle.turn_had_tools()
-                                && !client_feedback_handle.has_final_message()
-                                && silent_turn_retries < 1
-                            {
-                                silent_turn_retries += 1;
-                                client_feedback_handle.record_event(AcpEvent::Notice(
-                                    "Agent ended without a final response; requesting completion.".into(),
-                                ));
-                                current_req = Some(proto::PromptRequest::new(
-                                    proto::SessionId::new(acp_session_id.clone()),
-                                    vec![proto::ContentBlock::Text(proto::TextContent::new(
-                                        "Your last turn ended after tool activity without a final response. Review the original request and latest tool results. Continue any unfinished work, resolve or explain test failures and timeouts, and provide a final response describing the outcome and any remaining blockers.",
-                                    ))],
-                                ));
-                            }
+                        let prompt_succeeded = PromptLoop {
+                            conn: &*conn,
+                            client: &client_feedback_handle,
+                            replay_tracker: &replay_tracker,
+                            log_tx: &log_tx,
+                            cancel: &cancel,
+                            session_id: &acp_session_id,
+                            background_tasks: background_tasks.as_ref(),
+                            agent_pid,
+                            unanswered_prompt_retry_delays,
                         }
+                        .run(prompt_to_send)
+                        .await;
 
                         // Cancel session work before cleanup so the agent cannot keep
                         // starting background tasks while their process groups are stopped.
@@ -634,7 +527,11 @@ impl AcpAgentHarness {
 
                         // Notify container of completion
                         if let Some(tx) = exit_signal_tx.take() {
-                            let _ = tx.send(ExecutorExitResult::Success);
+                            let _ = tx.send(if prompt_succeeded {
+                                ExecutorExitResult::Success
+                            } else {
+                                ExecutorExitResult::Failure
+                            });
                         }
 
                         // Cleanup
@@ -655,6 +552,216 @@ struct SessionSetup {
     acp_session_id: String,
     display_session_id: String,
     prompt_to_send: String,
+}
+
+/// Pauses before resending a prompt the agent left unanswered, one per retry.
+///
+/// Kimi Code starts a turn of its own to deliver background task
+/// notifications (for example the one `TaskStop` produces), and its ACP
+/// server forwards nothing from such a turn. A prompt that reaches it while
+/// that turn is starting is answered at once with `end_turn` and no session
+/// update; the automatic turn then runs unseen until the execution ends and
+/// kills it. Once that turn is running, a new prompt queues behind it and gets
+/// a turn of its own, so the request is resent after a pause.
+const UNANSWERED_PROMPT_RETRY_DELAYS: [Duration; 2] =
+    [Duration::from_secs(2), Duration::from_secs(5)];
+
+const SILENT_TURN_RECOVERY_PROMPT: &str = "Your last turn ended after tool activity without a final response. Review the original request and latest tool results. Continue any unfinished work, resolve or explain test failures and timeouts, and provide a final response describing the outcome and any remaining blockers.";
+
+/// Sends prompts until a turn ends with nothing left to follow up on.
+struct PromptLoop<'a, A> {
+    conn: &'a A,
+    client: &'a AcpClient,
+    replay_tracker: &'a ProtocolReplayTracker,
+    log_tx: &'a mpsc::UnboundedSender<String>,
+    cancel: &'a CancellationToken,
+    session_id: &'a str,
+    background_tasks: Option<&'a BackgroundTaskTracker>,
+    agent_pid: Option<u32>,
+    unanswered_prompt_retry_delays: &'a [Duration],
+}
+
+impl<A: proto::Agent> PromptLoop<'_, A> {
+    fn request(&self, text: impl Into<String>) -> proto::PromptRequest {
+        proto::PromptRequest::new(
+            proto::SessionId::new(self.session_id.to_string()),
+            vec![proto::ContentBlock::Text(proto::TextContent::new(
+                text.into(),
+            ))],
+        )
+    }
+
+    /// Session updates the agent has written so far.
+    fn received_notifications(&self) -> usize {
+        self.replay_tracker.notifications.load(Ordering::Acquire)
+    }
+
+    /// Wait until every received session update has been handled. Returns
+    /// false if the execution was cancelled first.
+    async fn drain(&self) -> bool {
+        tokio::select! {
+            _ = self.cancel.cancelled() => false,
+            _ = self.client.drain_notifications(self.received_notifications()) => true,
+        }
+    }
+
+    async fn run(&self, prompt: String) -> bool {
+        let mut wait_policy = WaitPolicy::default();
+        let mut current_req = Some(self.request(prompt));
+        let mut silent_turn_retries = 0;
+        let mut unanswered_retries = 0;
+        let mut pause_before_send = None;
+
+        while let Some(req) = current_req.take() {
+            if self.cancel.is_cancelled() {
+                tracing::debug!("ACP executor cancelled, stopping prompt loop");
+                break;
+            }
+            if let Some(pause) = pause_before_send.take() {
+                tokio::select! {
+                    _ = self.cancel.cancelled() => break,
+                    _ = tokio::time::sleep(pause) => {}
+                }
+            }
+
+            // The protocol resolves responses independently of notification
+            // handlers. Drain the preceding turn before resetting its state.
+            if !self.drain().await {
+                break;
+            }
+            self.client.reset_turn_message();
+            let updates_before = self.received_notifications();
+            let resend = req.clone();
+            tracing::trace!(?req, "sending ACP prompt request");
+            // Send the prompt and await completion to obtain stop_reason
+            let prompt_result = tokio::select! {
+                _ = self.cancel.cancelled() => {
+                    tracing::debug!("ACP executor cancelled during prompt");
+                    break;
+                }
+                result = self.conn.prompt(req) => result,
+            };
+            if !self.drain().await {
+                break;
+            }
+            // Updates are counted from raw stdout before the response is
+            // parsed, so any update sent ahead of it is included here.
+            let answered = self.received_notifications() > updates_before;
+
+            let mut turn_ended = false;
+            let mut background_wait_abandoned = false;
+            match prompt_result {
+                Ok(resp) => {
+                    turn_ended = resp.stop_reason == proto::StopReason::EndTurn;
+                    // Emit done with stop_reason
+                    let stop_reason = serde_json::to_string(&resp.stop_reason).unwrap_or_default();
+                    let _ = self.log_tx.send(AcpEvent::Done(stop_reason).to_string());
+                }
+                Err(e) => {
+                    tracing::debug!("error {} {e} {:?}", e.code, e.data);
+                    if e.code == agent_client_protocol::ErrorCode::INTERNAL_ERROR.code
+                        && e.data
+                            .as_ref()
+                            .is_some_and(|d| d == "server shut down unexpectedly")
+                    {
+                        tracing::debug!("ACP server killed");
+                    } else {
+                        let _ = self
+                            .log_tx
+                            .send(AcpEvent::Error(format!("{e}")).to_string());
+                    }
+                }
+            }
+
+            // Flush any pending user feedback after finish
+            let feedback = self
+                .client
+                .drain_feedback()
+                .await
+                .join("\n")
+                .trim()
+                .to_string();
+            if !feedback.is_empty() {
+                tracing::trace!(?feedback, "sending ACP follow-up feedback");
+                unanswered_retries = 0;
+                current_req = Some(self.request(feedback));
+            }
+
+            if turn_ended
+                && current_req.is_none()
+                && !answered
+                && let Some(&pause) = self.unanswered_prompt_retry_delays.get(unanswered_retries)
+            {
+                unanswered_retries += 1;
+                self.client.record_event(AcpEvent::Notice(
+                    "Agent ended the turn without responding, likely while starting a turn of \
+                     its own; sending the request again."
+                        .into(),
+                ));
+                pause_before_send = Some(pause);
+                current_req = Some(resend);
+                continue;
+            }
+
+            if turn_ended
+                && current_req.is_none()
+                && !answered
+                && !self.unanswered_prompt_retry_delays.is_empty()
+            {
+                let _ = self.log_tx.send(AcpEvent::Error(
+                    "Agent repeatedly ended without responding; automatic recovery exhausted. Resume the session to continue.".into(),
+                ).to_string());
+                return false;
+            }
+            if answered {
+                // Each distinct prompt gets a fresh bounded retry budget.
+                unanswered_retries = 0;
+            }
+
+            if turn_ended
+                && current_req.is_none()
+                && let Some(tracker) = self.background_tasks
+            {
+                let agent_pid = self.agent_pid;
+                let live = tracker.live_tasks(|pid| {
+                    agent_pid.is_some_and(|agent| {
+                        workspace_utils::process::is_live_descendant(pid, agent)
+                    })
+                });
+                match wait_policy.after_turn(live, tracker.take_turn_tool_calls()) {
+                    AfterTurn::Finish => {}
+                    AfterTurn::Wait(tasks) => {
+                        self.client.record_event(AcpEvent::Notice(
+                            background_tasks::waiting_notice(&tasks),
+                        ));
+                        current_req = Some(self.request(background_tasks::wait_prompt(&tasks)));
+                    }
+                    AfterTurn::GiveUp(tasks) => {
+                        background_wait_abandoned = true;
+                        self.client.record_event(AcpEvent::Notice(
+                            background_tasks::give_up_notice(&tasks),
+                        ));
+                    }
+                }
+            }
+            // Some agents end immediately after a tool result without
+            // reporting the outcome. Give them one bounded recovery turn.
+            if turn_ended
+                && current_req.is_none()
+                && !background_wait_abandoned
+                && self.client.turn_had_tools()
+                && !self.client.has_final_message()
+                && silent_turn_retries < 1
+            {
+                silent_turn_retries += 1;
+                self.client.record_event(AcpEvent::Notice(
+                    "Agent ended without a final response; requesting completion.".into(),
+                ));
+                current_req = Some(self.request(SILENT_TURN_RECOVERY_PROMPT));
+            }
+        }
+        true
+    }
 }
 
 #[derive(Default)]
@@ -1325,6 +1432,311 @@ mod tests {
                 io_handle.abort();
             })
             .await;
+    }
+
+    const UNANSWERED_NOTICE: &str = "without responding";
+    const SILENT_NOTICE: &str = "without a final response";
+    const USER_PROMPT: &str = "analyze the file";
+
+    fn tool_call(id: &str, title: &str) -> serde_json::Value {
+        serde_json::json!({"sessionUpdate": "tool_call", "toolCallId": id, "title": title})
+    }
+
+    fn tool_completed(id: &str, text: &str) -> serde_json::Value {
+        serde_json::json!({
+            "sessionUpdate": "tool_call_update",
+            "toolCallId": id,
+            "status": "completed",
+            "content": [{"type": "content", "content": {"type": "text", "text": text}}],
+        })
+    }
+
+    fn agent_message(text: &str) -> serde_json::Value {
+        serde_json::json!({
+            "sessionUpdate": "agent_message_chunk",
+            "content": {"type": "text", "text": text},
+        })
+    }
+
+    /// The turn from the real failure: the agent stops a background task and
+    /// ends the turn without reporting anything.
+    fn task_stop_turn() -> Vec<serde_json::Value> {
+        vec![
+            tool_call("0:tool_9", "TaskStop"),
+            tool_completed("0:tool_9", "task_id: bash-1\nstatus: killed"),
+        ]
+    }
+
+    #[derive(Debug)]
+    struct ScriptedRun {
+        prompts: Vec<String>,
+        notices: Vec<String>,
+        dones: usize,
+        succeeded: bool,
+    }
+
+    /// Run the prompt loop against an agent that answers the n-th prompt with
+    /// the n-th list of session updates followed by `end_turn`, and answers
+    /// prompts beyond the script with a bare `end_turn`, like Kimi does for a
+    /// prompt that collides with its automatic notification turn.
+    async fn run_scripted(
+        turns: Vec<Vec<serde_json::Value>>,
+        retry_delays: &[Duration],
+        cancel_when_unanswered: bool,
+    ) -> ScriptedRun {
+        use std::{cell::RefCell, rc::Rc};
+
+        use tokio::io::{AsyncBufReadExt, BufReader};
+
+        tokio::task::LocalSet::new()
+            .run_until(async move {
+                let cancel = CancellationToken::new();
+                let (event_tx, mut event_rx) = mpsc::unbounded_channel();
+                let client = AcpClient::new(event_tx, None, cancel.clone());
+                let tracker = Arc::new(ProtocolReplayTracker::default());
+                let (client_stream, agent_stream) = tokio::io::duplex(64 * 1024);
+                let (client_read, client_write) = tokio::io::split(client_stream);
+                let (conn, io) = proto::ClientSideConnection::new(
+                    client.clone(),
+                    client_write.compat_write(),
+                    client_read.compat(),
+                    |fut| {
+                        tokio::task::spawn_local(fut);
+                    },
+                );
+                let io_handle = tokio::task::spawn_local(io);
+
+                let prompts = Rc::new(RefCell::new(Vec::new()));
+                let agent_prompts = prompts.clone();
+                let agent_tracker = tracker.clone();
+                let agent_handle = tokio::task::spawn_local(async move {
+                    let (read, mut write) = tokio::io::split(agent_stream);
+                    let mut lines = BufReader::new(read).lines();
+                    let mut turns = turns.into_iter();
+                    while let Ok(Some(line)) = lines.next_line().await {
+                        let request: serde_json::Value = serde_json::from_str(&line).unwrap();
+                        if request["method"] != "session/prompt" {
+                            continue;
+                        }
+                        agent_prompts.borrow_mut().push(
+                            request["params"]["prompt"][0]["text"]
+                                .as_str()
+                                .unwrap()
+                                .to_string(),
+                        );
+                        let mut payload = String::new();
+                        for update in turns.next().unwrap_or_default() {
+                            let notification = serde_json::json!({
+                                "jsonrpc": "2.0",
+                                "method": "session/update",
+                                "params": {"sessionId": "s1", "update": update},
+                            });
+                            payload.push_str(&format!("{notification}\n"));
+                        }
+                        let response = serde_json::json!({
+                            "jsonrpc": "2.0",
+                            "id": request["id"],
+                            "result": {"stopReason": "end_turn"},
+                        });
+                        payload.push_str(&format!("{response}\n"));
+                        // Mirror the stdout reader, which counts updates
+                        // before forwarding them.
+                        for line in payload.lines() {
+                            agent_tracker.record(line);
+                        }
+                        write.write_all(payload.as_bytes()).await.unwrap();
+                    }
+                });
+
+                let notices = Rc::new(RefCell::new(Vec::new()));
+                let collected_notices = notices.clone();
+                let cancel_on_notice = cancel.clone();
+                let events_handle = tokio::task::spawn_local(async move {
+                    while let Some(event) = event_rx.recv().await {
+                        match event {
+                            AcpEvent::Notice(notice) => {
+                                if cancel_when_unanswered && notice.contains(UNANSWERED_NOTICE) {
+                                    cancel_on_notice.cancel();
+                                }
+                                collected_notices.borrow_mut().push(notice);
+                            }
+                            // The loop logs Done elsewhere; this is the sentinel below.
+                            AcpEvent::Done(_) => break,
+                            _ => {}
+                        }
+                    }
+                });
+
+                let (log_tx, mut log_rx) = mpsc::unbounded_channel();
+                let prompt_loop = PromptLoop {
+                    conn: &conn,
+                    client: &client,
+                    replay_tracker: &tracker,
+                    log_tx: &log_tx,
+                    cancel: &cancel,
+                    session_id: "s1",
+                    background_tasks: None,
+                    agent_pid: None,
+                    unanswered_prompt_retry_delays: retry_delays,
+                };
+                let succeeded = tokio::time::timeout(
+                    Duration::from_secs(10),
+                    prompt_loop.run(USER_PROMPT.to_string()),
+                )
+                .await
+                .expect("prompt loop did not finish");
+
+                // Events arrive in order, so every notice is collected once
+                // the collector reaches this sentinel.
+                client.record_event(AcpEvent::Done(String::new()));
+                events_handle.await.unwrap();
+                drop(conn);
+                agent_handle.abort();
+                io_handle.abort();
+
+                let mut dones = 0;
+                while let Ok(line) = log_rx.try_recv() {
+                    if matches!(line.parse::<AcpEvent>(), Ok(AcpEvent::Done(_))) {
+                        dones += 1;
+                    }
+                }
+                ScriptedRun {
+                    prompts: prompts.borrow().clone(),
+                    notices: notices.borrow().clone(),
+                    dones,
+                    succeeded,
+                }
+            })
+            .await
+    }
+
+    #[tokio::test]
+    async fn resends_recovery_prompt_answered_by_kimi_automatic_turn() {
+        let quick = [Duration::from_millis(10); 2];
+        let run = run_scripted(
+            vec![
+                task_stop_turn(),
+                // The recovery prompt collides with the automatic
+                // notification turn and comes back empty.
+                vec![],
+                vec![agent_message("Stopped the task; the analysis is complete.")],
+            ],
+            &quick,
+            false,
+        )
+        .await;
+
+        assert_eq!(
+            run.prompts,
+            [
+                USER_PROMPT,
+                SILENT_TURN_RECOVERY_PROMPT,
+                SILENT_TURN_RECOVERY_PROMPT,
+            ]
+        );
+        assert!(run.succeeded);
+        assert_eq!(run.dones, 3);
+        assert_eq!(run.notices.len(), 2, "{:?}", run.notices);
+        assert!(run.notices[0].contains(SILENT_NOTICE));
+        assert!(run.notices[1].contains(UNANSWERED_NOTICE));
+    }
+
+    #[tokio::test]
+    async fn final_reply_after_tools_ends_without_extra_turns() {
+        let quick = [Duration::from_millis(10); 2];
+        let mut turn = task_stop_turn();
+        turn.push(agent_message("Stopped the task; the analysis is complete."));
+        let run = run_scripted(vec![turn], &quick, false).await;
+
+        assert_eq!(run.prompts, [USER_PROMPT]);
+        assert_eq!(run.dones, 1);
+        assert!(run.notices.is_empty(), "{:?}", run.notices);
+    }
+
+    #[tokio::test]
+    async fn plain_reply_without_tools_ends_without_extra_turns() {
+        let quick = [Duration::from_millis(10); 2];
+        let run = run_scripted(vec![vec![agent_message("Hello")]], &quick, false).await;
+
+        assert_eq!(run.prompts, [USER_PROMPT]);
+        assert!(run.notices.is_empty(), "{:?}", run.notices);
+    }
+
+    #[tokio::test]
+    async fn unanswered_prompt_retries_are_bounded() {
+        let quick = [Duration::from_millis(10); 2];
+        let run = run_scripted(vec![task_stop_turn()], &quick, false).await;
+
+        // One recovery prompt, then one resend per configured delay.
+        assert_eq!(run.prompts.len(), 2 + quick.len(), "{:?}", run.prompts);
+        assert_eq!(run.dones, run.prompts.len());
+        assert_eq!(
+            run.notices
+                .iter()
+                .filter(|notice| notice.contains(UNANSWERED_NOTICE))
+                .count(),
+            quick.len()
+        );
+        assert!(!run.succeeded, "exhaustion must fail the execution");
+        assert_eq!(UNANSWERED_PROMPT_RETRY_DELAYS.len(), 2);
+    }
+
+    #[tokio::test]
+    async fn answered_prompt_resets_unanswered_retry_budget() {
+        let quick = [Duration::from_millis(1); 2];
+        let run = run_scripted(
+            vec![
+                vec![],
+                vec![],
+                task_stop_turn(),
+                vec![],
+                vec![],
+                vec![agent_message("Done")],
+            ],
+            &quick,
+            false,
+        )
+        .await;
+        assert!(run.succeeded);
+        assert_eq!(run.prompts.len(), 6);
+        assert_eq!(
+            run.notices
+                .iter()
+                .filter(|notice| notice.contains(UNANSWERED_NOTICE))
+                .count(),
+            4
+        );
+    }
+
+    #[tokio::test]
+    async fn agents_without_retry_keep_previous_behavior() {
+        let run = run_scripted(
+            vec![
+                task_stop_turn(),
+                vec![],
+                vec![agent_message("never requested")],
+            ],
+            &[],
+            false,
+        )
+        .await;
+
+        assert_eq!(run.prompts, [USER_PROMPT, SILENT_TURN_RECOVERY_PROMPT]);
+        assert_eq!(run.dones, 2);
+        assert!(
+            run.notices
+                .iter()
+                .all(|notice| !notice.contains(UNANSWERED_NOTICE))
+        );
+    }
+
+    #[tokio::test]
+    async fn cancellation_interrupts_retry_pause() {
+        // The pause would outlast the test timeout if cancellation were ignored.
+        let long = [Duration::from_secs(3600)];
+        let run = run_scripted(vec![task_stop_turn()], &long, true).await;
+
+        assert_eq!(run.prompts, [USER_PROMPT, SILENT_TURN_RECOVERY_PROMPT]);
     }
 
     #[tokio::test]

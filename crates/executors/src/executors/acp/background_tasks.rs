@@ -12,9 +12,11 @@
 //! parses them, so every update sent ahead of a prompt response is recorded by
 //! the time that response resolves.
 //!
-//! Known gap: a task that exits in the moment between the end of a turn and
-//! the liveness check makes Kimi start its own (invisible) turn, and a prompt
-//! sent then would only queue behind it, so its result is not reported.
+//! Known gap: a task that exits (or is stopped with `TaskStop`) around the end
+//! of a turn makes Kimi start its own (invisible) turn. A prompt that arrives
+//! as that turn starts comes back as an empty `end_turn`; the harness resends
+//! it (see `UNANSWERED_PROMPT_RETRY_DELAYS` in `harness.rs`) so the agent can
+//! report afterwards, but the automatic turn's own output is never shown.
 
 use std::{
     collections::{BTreeMap, BTreeSet},

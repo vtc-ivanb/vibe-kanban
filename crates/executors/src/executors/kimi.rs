@@ -60,7 +60,8 @@ impl KimiCode {
             } else {
                 "default"
             })
-            .with_background_task_wait();
+            .with_background_task_wait()
+            .with_unanswered_prompt_retry();
         if let Some(model) = &self.model {
             harness = harness.with_model(model);
         }
