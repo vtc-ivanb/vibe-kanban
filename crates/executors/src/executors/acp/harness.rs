@@ -401,7 +401,7 @@ impl AcpAgentHarness {
                             reset_to_message_id.as_deref(),
                             &prompt,
                             initialize_response.agent_capabilities.load_session,
-                            Some(replay_tracker),
+                            Some(replay_tracker.clone()),
                             &client_feedback_handle,
                         )
                         .await
@@ -489,12 +489,22 @@ impl AcpAgentHarness {
 
                         let mut current_req = Some(initial_req);
 
+                        let mut silent_turn_retries = 0;
                         while let Some(req) = current_req.take() {
                             if cancel.is_cancelled() {
                                 tracing::debug!("ACP executor cancelled, stopping prompt loop");
                                 break;
                             }
 
+                            // The protocol resolves responses independently of notification
+                            // handlers. Drain the preceding turn before resetting its state.
+                            tokio::select! {
+                                _ = cancel.cancelled() => break,
+                                _ = client_feedback_handle.drain_notifications(
+                                    replay_tracker.notifications.load(std::sync::atomic::Ordering::Acquire)
+                                ) => {}
+                            }
+                            client_feedback_handle.reset_turn_message();
                             tracing::trace!(?req, "sending ACP prompt request");
                             // Send the prompt and await completion to obtain stop_reason
                             let prompt_result = tokio::select! {
@@ -505,7 +515,14 @@ impl AcpAgentHarness {
                                 result = conn.prompt(req) => result,
                             };
 
+                            tokio::select! {
+                                _ = cancel.cancelled() => break,
+                                _ = client_feedback_handle.drain_notifications(
+                                    replay_tracker.notifications.load(std::sync::atomic::Ordering::Acquire)
+                                ) => {}
+                            }
                             let mut turn_ended = false;
+                            let mut background_wait_abandoned = false;
                             match prompt_result {
                                 Ok(resp) => {
                                     turn_ended = resp.stop_reason == proto::StopReason::EndTurn;
@@ -574,11 +591,32 @@ impl AcpAgentHarness {
                                         ));
                                     }
                                     AfterTurn::GiveUp(tasks) => {
+                                        background_wait_abandoned = true;
                                         client_feedback_handle.record_event(AcpEvent::Notice(
                                             background_tasks::give_up_notice(&tasks),
                                         ));
                                     }
                                 }
+                            }
+                            // Some agents end immediately after a tool result without
+                            // reporting the outcome. Give them one bounded recovery turn.
+                            if turn_ended
+                                && current_req.is_none()
+                                && !background_wait_abandoned
+                                && client_feedback_handle.turn_had_tools()
+                                && !client_feedback_handle.has_final_message()
+                                && silent_turn_retries < 1
+                            {
+                                silent_turn_retries += 1;
+                                client_feedback_handle.record_event(AcpEvent::Notice(
+                                    "Agent ended without a final response; requesting completion.".into(),
+                                ));
+                                current_req = Some(proto::PromptRequest::new(
+                                    proto::SessionId::new(acp_session_id.clone()),
+                                    vec![proto::ContentBlock::Text(proto::TextContent::new(
+                                        "Your last turn ended after tool activity without a final response. Review the original request and latest tool results. Continue any unfinished work, resolve or explain test failures and timeouts, and provide a final response describing the outcome and any remaining blockers.",
+                                    ))],
+                                ));
                             }
                         }
 
@@ -630,6 +668,7 @@ struct ReplayProtocolState {
 struct ProtocolReplayTracker {
     state: std::sync::Mutex<ReplayProtocolState>,
     response_received: tokio::sync::Notify,
+    notifications: std::sync::atomic::AtomicUsize,
 }
 
 impl ProtocolReplayTracker {
@@ -651,6 +690,10 @@ impl ProtocolReplayTracker {
                 serde_json::from_value::<proto::SessionNotification>(params.clone()).is_ok()
             });
 
+        if is_session_update {
+            self.notifications
+                .fetch_add(1, std::sync::atomic::Ordering::AcqRel);
+        }
         let mut state = self.state.lock().unwrap();
         if !state.active {
             return;
@@ -1198,6 +1241,84 @@ mod tests {
                     event_rx.recv().await,
                     Some(AcpEvent::Message(proto::ContentBlock::Text(content))) if content.text == "new"
                 ));
+
+                drop(conn);
+                agent_handle.abort();
+                io_handle.abort();
+            })
+            .await;
+    }
+
+    #[tokio::test]
+    async fn prompt_drains_final_message_batched_with_response() {
+        use tokio::io::{AsyncBufReadExt, BufReader};
+
+        tokio::task::LocalSet::new()
+            .run_until(async {
+                let (event_tx, mut event_rx) = mpsc::unbounded_channel();
+                let client = AcpClient::new(event_tx, None, CancellationToken::new());
+                let tracker = Arc::new(ProtocolReplayTracker::default());
+                let agent_tracker = tracker.clone();
+                let (client_stream, agent_stream) = tokio::io::duplex(4096);
+                let (client_read, client_write) = tokio::io::split(client_stream);
+                let (conn, io) = proto::ClientSideConnection::new(
+                    client.clone(),
+                    client_write.compat_write(),
+                    client_read.compat(),
+                    |fut| {
+                        tokio::task::spawn_local(fut);
+                    },
+                );
+                let io_handle = tokio::task::spawn_local(io);
+                let agent_handle = tokio::task::spawn_local(async move {
+                    let mut agent_stream = BufReader::new(agent_stream);
+                    let mut request = String::new();
+                    agent_stream.read_line(&mut request).await.unwrap();
+                    let request: serde_json::Value = serde_json::from_str(&request).unwrap();
+                    let mut payload = (0..100)
+                        .map(|index| {
+                            serde_json::json!({
+                                "jsonrpc": "2.0",
+                                "method": "session/update",
+                                "params": {
+                                    "sessionId": "previous",
+                                    "update": {
+                                        "sessionUpdate": "agent_message_chunk",
+                                        "content": { "type": "text", "text": format!("old {index}") }
+                                    }
+                                }
+                            })
+                            .to_string()
+                        })
+                        .collect::<Vec<_>>()
+                        .join("\n");
+                    let response = serde_json::json!({
+                        "jsonrpc": "2.0",
+                        "id": request["id"],
+                        "result": {"stopReason": "end_turn"}
+                    });
+                    payload.push_str(&format!("\n{response}\n"));
+                    for line in payload.lines() {
+                        agent_tracker.record(line);
+                    }
+                    agent_stream
+                        .get_mut()
+                        .write_all(payload.as_bytes())
+                        .await
+                        .unwrap();
+                });
+
+                client.reset_turn_message();
+                conn.prompt(proto::PromptRequest::new(
+                    "previous",
+                    vec![proto::ContentBlock::Text(proto::TextContent::new("work"))],
+                )).await.unwrap();
+                tokio::time::timeout(
+                    std::time::Duration::from_secs(10),
+                    client.drain_notifications(tracker.notifications.load(std::sync::atomic::Ordering::Acquire)),
+                ).await.expect("notification drain timed out");
+                assert!(client.has_final_message(), "completed response must suppress recovery");
+                assert!(event_rx.try_recv().is_ok());
 
                 drop(conn);
                 agent_handle.abort();

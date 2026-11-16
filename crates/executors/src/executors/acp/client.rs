@@ -23,6 +23,10 @@ pub struct AcpClient {
     feedback_queue: Arc<Mutex<Vec<String>>>,
     cancel: CancellationToken,
     replaying_history: Arc<AtomicBool>,
+    final_message_after_tool: Arc<AtomicBool>,
+    turn_had_tools: Arc<AtomicBool>,
+    processed_notifications: Arc<AtomicUsize>,
+    notification_processed: Arc<Notify>,
     replayed_notifications: Arc<AtomicUsize>,
     replay_notification_processed: Arc<Notify>,
 }
@@ -40,9 +44,37 @@ impl AcpClient {
             feedback_queue: Arc::new(Mutex::new(Vec::new())),
             cancel,
             replaying_history: Arc::new(AtomicBool::new(false)),
+            final_message_after_tool: Arc::new(AtomicBool::new(false)),
+            turn_had_tools: Arc::new(AtomicBool::new(false)),
+            processed_notifications: Arc::new(AtomicUsize::new(0)),
+            notification_processed: Arc::new(Notify::new()),
             replayed_notifications: Arc::new(AtomicUsize::new(0)),
             replay_notification_processed: Arc::new(Notify::new()),
         }
+    }
+
+    pub fn reset_turn_message(&self) {
+        self.turn_had_tools.store(false, Ordering::Release);
+        self.final_message_after_tool
+            .store(false, Ordering::Release);
+    }
+
+    pub fn turn_had_tools(&self) -> bool {
+        self.turn_had_tools.load(Ordering::Acquire)
+    }
+
+    pub async fn drain_notifications(&self, expected: usize) {
+        loop {
+            let notified = self.notification_processed.notified();
+            if self.processed_notifications.load(Ordering::Acquire) >= expected {
+                return;
+            }
+            notified.await;
+        }
+    }
+
+    pub fn has_final_message(&self) -> bool {
+        self.final_message_after_tool.load(Ordering::Acquire)
     }
 
     pub fn set_history_replay(&self, replaying: bool) {
@@ -201,10 +233,30 @@ impl acp::Client for AcpClient {
     }
 
     async fn session_notification(&self, args: acp::SessionNotification) -> Result<(), acp::Error> {
+        self.processed_notifications.fetch_add(1, Ordering::AcqRel);
+        self.notification_processed.notify_one();
         if self.replaying_history.load(Ordering::Acquire) {
             self.replayed_notifications.fetch_add(1, Ordering::AcqRel);
             self.replay_notification_processed.notify_one();
             return Ok(());
+        }
+
+        match &args.update {
+            acp::SessionUpdate::AgentMessageChunk(chunk) => {
+                let has_content = match &chunk.content {
+                    acp::ContentBlock::Text(text) => !text.text.trim().is_empty(),
+                    _ => true,
+                };
+                if has_content {
+                    self.final_message_after_tool.store(true, Ordering::Release);
+                }
+            }
+            acp::SessionUpdate::ToolCall(_) => {
+                self.turn_had_tools.store(true, Ordering::Release);
+                self.final_message_after_tool
+                    .store(false, Ordering::Release);
+            }
+            _ => {}
         }
 
         // Convert to typed events
@@ -313,6 +365,59 @@ impl AcpClient {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[tokio::test]
+    async fn final_message_ignores_whitespace_and_replayed_history() {
+        use acp::Client;
+        let (tx, _rx) = mpsc::unbounded_channel();
+        let client = AcpClient::new(tx, None, CancellationToken::new());
+        client
+            .session_notification(notification("  "))
+            .await
+            .unwrap();
+        assert!(!client.has_final_message());
+        client
+            .session_notification(notification("Finished"))
+            .await
+            .unwrap();
+        assert!(client.has_final_message());
+        client.reset_turn_message();
+        client.set_history_replay(true);
+        client
+            .session_notification(notification("Old response"))
+            .await
+            .unwrap();
+        assert!(!client.has_final_message());
+    }
+
+    #[tokio::test]
+    async fn late_tool_updates_preserve_final_response() {
+        use acp::Client;
+        let (tx, _rx) = mpsc::unbounded_channel();
+        let client = AcpClient::new(tx, None, CancellationToken::new());
+        let tool: acp::SessionNotification = serde_json::from_value(serde_json::json!({
+            "sessionId": "session",
+            "update": {"sessionUpdate": "tool_call", "toolCallId": "tool", "title": "test"}
+        }))
+        .unwrap();
+        client.session_notification(tool).await.unwrap();
+        assert!(client.turn_had_tools());
+        assert!(!client.has_final_message());
+        client
+            .session_notification(notification("Done"))
+            .await
+            .unwrap();
+        let update = serde_json::from_value(serde_json::json!({
+            "sessionId": "session",
+            "update": {"sessionUpdate": "tool_call_update", "toolCallId": "tool", "status": "completed"}
+        })).unwrap();
+        client.session_notification(update).await.unwrap();
+        assert!(client.has_final_message());
+        client.drain_notifications(3).await;
+        client.reset_turn_message();
+        assert!(!client.turn_had_tools());
+        assert!(!client.has_final_message());
+    }
 
     fn notification(text: &str) -> acp::SessionNotification {
         acp::SessionNotification::new(
