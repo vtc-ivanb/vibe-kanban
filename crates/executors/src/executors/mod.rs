@@ -316,12 +316,20 @@ pub trait StandardCodingAgentExecutor {
 }
 
 /// Result communicated through the exit signal
-#[derive(Debug, Clone, Copy)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub enum ExecutorExitResult {
     /// Process completed successfully (exit code 0)
     Success,
     /// Process should be marked as failed (non-zero exit)
     Failure,
+    /// Process should be marked as failed, but the agent got stuck in a way a
+    /// fresh agent process resuming the saved session can recover from. The
+    /// container may start one such restart; otherwise this is a plain failure.
+    RestartRequested {
+        /// Agent session the replacement must resume: the one this execution
+        /// reported, not whatever turn happens to be persisted last.
+        session_id: String,
+    },
 }
 
 /// Optional exit notification from an executor.

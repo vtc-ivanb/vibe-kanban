@@ -499,7 +499,11 @@ impl AcpAgentHarness {
                             } else {
                                 &[]
                             };
-                        let prompt_succeeded = PromptLoop {
+                        // A process started to recover from an unresponsive agent
+                        // must not ask for another restart; the cap is one.
+                        let restart_on_exhaustion =
+                            restart_on_exhaustion(retry_unanswered_prompts, &prompt);
+                        let outcome = PromptLoop {
                             conn: &*conn,
                             client: &client_feedback_handle,
                             replay_tracker: &replay_tracker,
@@ -509,6 +513,7 @@ impl AcpAgentHarness {
                             background_tasks: background_tasks.as_ref(),
                             agent_pid,
                             unanswered_prompt_retry_delays,
+                            restart_on_exhaustion,
                         }
                         .run(prompt_to_send)
                         .await;
@@ -527,11 +532,7 @@ impl AcpAgentHarness {
 
                         // Notify container of completion
                         if let Some(tx) = exit_signal_tx.take() {
-                            let _ = tx.send(if prompt_succeeded {
-                                ExecutorExitResult::Success
-                            } else {
-                                ExecutorExitResult::Failure
-                            });
+                            let _ = tx.send(outcome.exit_result(&display_session_id));
                         }
 
                         // Cleanup
@@ -568,6 +569,59 @@ const UNANSWERED_PROMPT_RETRY_DELAYS: [Duration; 2] =
 
 const SILENT_TURN_RECOVERY_PROMPT: &str = "Your last turn ended after tool activity without a final response. Review the original request and latest tool results. Continue any unfinished work, resolve or explain test failures and timeouts, and provide a final response describing the outcome and any remaining blockers.";
 
+/// Sent to a fresh agent process that resumes the saved session after the
+/// previous process stopped answering prompts (see
+/// [`ExecutorExitResult::RestartRequested`]). It replaces the original request
+/// instead of replaying it: earlier work may already have run, so the agent
+/// has to check what happened before doing anything again.
+///
+/// The container identifies restart processes by this exact prefix, so it
+/// must stay stable.
+pub const UNRESPONSIVE_AGENT_RESTART_PROMPT: &str = "The previous agent process stopped responding (it repeatedly ended turns without any output) and was restarted, resuming this session. Earlier work from this session may already have been carried out, partially or fully. Before doing anything else, inspect the current state: review the conversation history, the files in the workspace, git status and recent commits, and the output of any commands or background tasks you started. Do not blindly repeat commands or side effects (edits, commits, pushes, installs, messages, deployments) that may already have happened; only redo a step after confirming it did not take effect. Then complete the original task from this session and finish with a final response describing what was already done, what you did now, and any remaining blockers.";
+
+const UNRESPONSIVE_AGENT_RESTART_NOTICE: &str = "Agent repeatedly ended without responding; restarting the agent process to resume the session.";
+
+/// True if `prompt` starts a process meant to recover an unresponsive agent.
+pub fn is_unresponsive_agent_restart_prompt(prompt: &str) -> bool {
+    // Executors may append profile text to the prompt, never prepend.
+    prompt
+        .trim_start()
+        .starts_with(UNRESPONSIVE_AGENT_RESTART_PROMPT)
+}
+
+/// Whether a process should ask to be replaced once it stops answering. Only
+/// agents with unanswered prompt retries do, and a process that is already
+/// such a replacement never does, so there is at most one restart.
+fn restart_on_exhaustion(retry_unanswered_prompts: bool, prompt: &str) -> bool {
+    retry_unanswered_prompts && !is_unresponsive_agent_restart_prompt(prompt)
+}
+
+/// How a prompt loop ended.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum PromptOutcome {
+    /// Finished normally, or stopped because the execution was cancelled.
+    Completed,
+    /// Failed with nothing left to try.
+    Failed,
+    /// The agent stopped answering prompts; a fresh process resuming the
+    /// session should take over.
+    RestartRequested,
+}
+
+impl PromptOutcome {
+    /// `session_id` is the session this execution reported to Vibe Kanban,
+    /// which a replacement process has to resume.
+    fn exit_result(self, session_id: &str) -> ExecutorExitResult {
+        match self {
+            Self::Completed => ExecutorExitResult::Success,
+            Self::Failed => ExecutorExitResult::Failure,
+            Self::RestartRequested => ExecutorExitResult::RestartRequested {
+                session_id: session_id.to_string(),
+            },
+        }
+    }
+}
+
 /// Sends prompts until a turn ends with nothing left to follow up on.
 struct PromptLoop<'a, A> {
     conn: &'a A,
@@ -579,6 +633,9 @@ struct PromptLoop<'a, A> {
     background_tasks: Option<&'a BackgroundTaskTracker>,
     agent_pid: Option<u32>,
     unanswered_prompt_retry_delays: &'a [Duration],
+    /// Ask for a fresh agent process, instead of failing, once the unanswered
+    /// prompt retries are exhausted.
+    restart_on_exhaustion: bool,
 }
 
 impl<A: proto::Agent> PromptLoop<'_, A> {
@@ -605,7 +662,7 @@ impl<A: proto::Agent> PromptLoop<'_, A> {
         }
     }
 
-    async fn run(&self, prompt: String) -> bool {
+    async fn run(&self, prompt: String) -> PromptOutcome {
         let mut wait_policy = WaitPolicy::default();
         let mut current_req = Some(self.request(prompt));
         let mut silent_turn_retries = 0;
@@ -708,10 +765,21 @@ impl<A: proto::Agent> PromptLoop<'_, A> {
                 && !answered
                 && !self.unanswered_prompt_retry_delays.is_empty()
             {
+                if self.restart_on_exhaustion {
+                    // Resending to this process keeps failing, while a fresh
+                    // process resuming the session recovers. Let the container
+                    // start one.
+                    // Logged directly, like the terminal error below, so it
+                    // is written before the exit signal ends the execution.
+                    let _ = self.log_tx.send(
+                        AcpEvent::Notice(UNRESPONSIVE_AGENT_RESTART_NOTICE.into()).to_string(),
+                    );
+                    return PromptOutcome::RestartRequested;
+                }
                 let _ = self.log_tx.send(AcpEvent::Error(
                     "Agent repeatedly ended without responding; automatic recovery exhausted. Resume the session to continue.".into(),
                 ).to_string());
-                return false;
+                return PromptOutcome::Failed;
             }
             if answered {
                 // Each distinct prompt gets a fresh bounded retry budget.
@@ -760,7 +828,7 @@ impl<A: proto::Agent> PromptLoop<'_, A> {
                 current_req = Some(self.request(SILENT_TURN_RECOVERY_PROMPT));
             }
         }
-        true
+        PromptOutcome::Completed
     }
 }
 
@@ -1471,8 +1539,11 @@ mod tests {
     struct ScriptedRun {
         prompts: Vec<String>,
         notices: Vec<String>,
+        /// Notices and errors the loop logged directly, in order.
+        logged: Vec<AcpEvent>,
         dones: usize,
         succeeded: bool,
+        outcome: PromptOutcome,
     }
 
     /// Run the prompt loop against an agent that answers the n-th prompt with
@@ -1484,6 +1555,24 @@ mod tests {
         retry_delays: &[Duration],
         cancel_when_unanswered: bool,
     ) -> ScriptedRun {
+        run_scripted_with(
+            turns,
+            retry_delays,
+            cancel_when_unanswered,
+            USER_PROMPT,
+            false,
+        )
+        .await
+    }
+
+    async fn run_scripted_with(
+        turns: Vec<Vec<serde_json::Value>>,
+        retry_delays: &[Duration],
+        cancel_when_unanswered: bool,
+        prompt: &str,
+        restart_on_exhaustion: bool,
+    ) -> ScriptedRun {
+        let prompt = prompt.to_string();
         use std::{cell::RefCell, rc::Rc};
 
         use tokio::io::{AsyncBufReadExt, BufReader};
@@ -1578,13 +1667,12 @@ mod tests {
                     background_tasks: None,
                     agent_pid: None,
                     unanswered_prompt_retry_delays: retry_delays,
+                    restart_on_exhaustion,
                 };
-                let succeeded = tokio::time::timeout(
-                    Duration::from_secs(10),
-                    prompt_loop.run(USER_PROMPT.to_string()),
-                )
-                .await
-                .expect("prompt loop did not finish");
+                let outcome =
+                    tokio::time::timeout(Duration::from_secs(10), prompt_loop.run(prompt))
+                        .await
+                        .expect("prompt loop did not finish");
 
                 // Events arrive in order, so every notice is collected once
                 // the collector reaches this sentinel.
@@ -1595,16 +1683,23 @@ mod tests {
                 io_handle.abort();
 
                 let mut dones = 0;
+                let mut logged = Vec::new();
                 while let Ok(line) = log_rx.try_recv() {
-                    if matches!(line.parse::<AcpEvent>(), Ok(AcpEvent::Done(_))) {
-                        dones += 1;
+                    match line.parse::<AcpEvent>() {
+                        Ok(AcpEvent::Done(_)) => dones += 1,
+                        Ok(event @ (AcpEvent::Notice(_) | AcpEvent::Error(_))) => {
+                            logged.push(event)
+                        }
+                        _ => {}
                     }
                 }
                 ScriptedRun {
                     prompts: prompts.borrow().clone(),
                     notices: notices.borrow().clone(),
+                    logged,
                     dones,
-                    succeeded,
+                    succeeded: outcome != PromptOutcome::Failed,
+                    outcome,
                 }
             })
             .await
@@ -1737,6 +1832,175 @@ mod tests {
         let run = run_scripted(vec![task_stop_turn()], &long, true).await;
 
         assert_eq!(run.prompts, [USER_PROMPT, SILENT_TURN_RECOVERY_PROMPT]);
+    }
+
+    fn logged_errors(run: &ScriptedRun) -> Vec<&str> {
+        run.logged
+            .iter()
+            .filter_map(|event| match event {
+                AcpEvent::Error(message) => Some(message.as_str()),
+                _ => None,
+            })
+            .collect()
+    }
+
+    fn logged_notices(run: &ScriptedRun) -> Vec<&str> {
+        run.logged
+            .iter()
+            .filter_map(|event| match event {
+                AcpEvent::Notice(message) => Some(message.as_str()),
+                _ => None,
+            })
+            .collect()
+    }
+
+    #[tokio::test]
+    async fn exhausted_unanswered_retries_request_process_restart() {
+        let quick = [Duration::from_millis(1); 2];
+        let run = run_scripted_with(vec![task_stop_turn()], &quick, false, USER_PROMPT, true).await;
+
+        assert_eq!(run.outcome, PromptOutcome::RestartRequested);
+        assert_eq!(
+            run.outcome.exit_result("display-session"),
+            ExecutorExitResult::RestartRequested {
+                session_id: "display-session".into()
+            }
+        );
+        // Same-process retries still run first and stay bounded.
+        assert_eq!(run.prompts.len(), 2 + quick.len(), "{:?}", run.prompts);
+        assert_eq!(
+            logged_notices(&run),
+            [UNRESPONSIVE_AGENT_RESTART_NOTICE],
+            "{:?}",
+            run.logged
+        );
+        assert!(logged_errors(&run).is_empty(), "{:?}", run.logged);
+    }
+
+    #[tokio::test]
+    async fn restart_process_resolves_with_diagnostic_prompt_only() {
+        let quick = [Duration::from_millis(1); 2];
+        let restart_prompt = format!("{UNRESPONSIVE_AGENT_RESTART_PROMPT}\n\nprofile suffix");
+        let run = run_scripted_with(
+            vec![vec![agent_message(
+                "The analysis was already written; nothing left to do.",
+            )]],
+            &quick,
+            false,
+            &restart_prompt,
+            restart_on_exhaustion(true, &restart_prompt),
+        )
+        .await;
+
+        assert_eq!(run.outcome, PromptOutcome::Completed);
+        assert_eq!(run.prompts, [restart_prompt]);
+        assert!(run.logged.is_empty(), "{:?}", run.logged);
+    }
+
+    #[tokio::test]
+    async fn unanswered_restart_process_fails_without_another_restart() {
+        let quick = [Duration::from_millis(1); 2];
+        let restart_prompt = UNRESPONSIVE_AGENT_RESTART_PROMPT.to_string();
+        let run = run_scripted_with(
+            vec![],
+            &quick,
+            false,
+            &restart_prompt,
+            restart_on_exhaustion(true, &restart_prompt),
+        )
+        .await;
+
+        assert_eq!(run.outcome, PromptOutcome::Failed);
+        assert_eq!(
+            run.outcome.exit_result("display-session"),
+            ExecutorExitResult::Failure
+        );
+        // Only the diagnostic prompt is ever resent; the original request is
+        // never replayed.
+        assert_eq!(run.prompts.len(), 1 + quick.len());
+        assert!(
+            run.prompts.iter().all(|prompt| prompt == &restart_prompt),
+            "{:?}",
+            run.prompts
+        );
+        assert!(logged_notices(&run).is_empty(), "{:?}", run.logged);
+        let errors = logged_errors(&run);
+        assert_eq!(errors.len(), 1, "{:?}", run.logged);
+        assert!(errors[0].contains("automatic recovery exhausted"));
+    }
+
+    #[tokio::test]
+    async fn cancellation_during_retries_never_requests_restart() {
+        let long = [Duration::from_secs(3600)];
+        let run = run_scripted_with(vec![task_stop_turn()], &long, true, USER_PROMPT, true).await;
+
+        assert_eq!(run.outcome, PromptOutcome::Completed);
+        assert_eq!(run.prompts, [USER_PROMPT, SILENT_TURN_RECOVERY_PROMPT]);
+        assert!(run.logged.is_empty(), "{:?}", run.logged);
+    }
+
+    #[test]
+    fn restart_is_limited_to_retrying_agents_and_one_attempt() {
+        assert!(restart_on_exhaustion(true, USER_PROMPT));
+        // Other ACP agents keep failing as before.
+        assert!(!restart_on_exhaustion(false, USER_PROMPT));
+        // A restarted process must not ask for another restart, even with a
+        // profile's appended prompt.
+        assert!(!restart_on_exhaustion(
+            true,
+            &format!("{UNRESPONSIVE_AGENT_RESTART_PROMPT} Use pnpm.")
+        ));
+        // Users quoting the text inside their own request are not restarts.
+        assert!(restart_on_exhaustion(
+            true,
+            &format!("Fix this: {UNRESPONSIVE_AGENT_RESTART_PROMPT}")
+        ));
+    }
+
+    #[tokio::test]
+    async fn restart_resumes_saved_session_with_diagnostic_prompt() {
+        let agent = FakeAgent::default();
+        let test = TestManager::new();
+        test.add_history("failed-run");
+        test.manager
+            .set_native_session_id("failed-run", "kimi-native")
+            .unwrap();
+        let original = test.manager.read_session_raw("failed-run").unwrap();
+
+        let setup = establish_session(
+            &agent,
+            &test.manager,
+            Path::new("/tmp/workspace"),
+            Some("failed-run".to_string()),
+            None,
+            UNRESPONSIVE_AGENT_RESTART_PROMPT,
+            true,
+            None,
+            &client(),
+        )
+        .await
+        .unwrap();
+
+        // The agent's own session is loaded rather than a new one created.
+        assert_eq!(setup.acp_session_id, "kimi-native");
+        assert!(agent.new_session_requests.lock().unwrap().is_empty());
+        assert_eq!(agent.load_session_requests.lock().unwrap().len(), 1);
+        // The restart sends only the diagnostic prompt, not the original request.
+        assert_eq!(setup.prompt_to_send, UNRESPONSIVE_AGENT_RESTART_PROMPT);
+        // Vibe Kanban's history continues in a new snapshot.
+        assert_ne!(setup.display_session_id, "failed-run");
+        assert_eq!(
+            test.manager
+                .read_session_raw(&setup.display_session_id)
+                .unwrap(),
+            original
+        );
+        assert_eq!(
+            test.manager
+                .native_session_id(&setup.display_session_id)
+                .unwrap(),
+            "kimi-native"
+        );
     }
 
     #[tokio::test]

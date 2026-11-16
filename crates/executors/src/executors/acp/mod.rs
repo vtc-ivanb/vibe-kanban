@@ -7,7 +7,9 @@ pub mod session;
 use std::{fmt::Display, str::FromStr};
 
 pub use client::AcpClient;
-pub use harness::AcpAgentHarness;
+pub use harness::{
+    AcpAgentHarness, UNRESPONSIVE_AGENT_RESTART_PROMPT, is_unresponsive_agent_restart_prompt,
+};
 pub use normalize_logs::*;
 use serde::{Deserialize, Serialize};
 pub use session::SessionManager;

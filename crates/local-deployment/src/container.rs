@@ -34,7 +34,10 @@ use executors::{
     },
     approvals::{ExecutorApprovalService, NoopExecutorApprovalService},
     env::{ExecutionEnv, RepoContext},
-    executors::{BaseCodingAgent, CancellationToken, ExecutorExitResult, ExecutorExitSignal},
+    executors::{
+        BaseCodingAgent, CancellationToken, ExecutorExitResult, ExecutorExitSignal,
+        acp::{UNRESPONSIVE_AGENT_RESTART_PROMPT, is_unresponsive_agent_restart_prompt},
+    },
     logs::{
         NormalizedEntryError, NormalizedEntryType,
         utils::patch::extract_normalized_entry_from_patch,
@@ -47,7 +50,7 @@ use services::services::{
     analytics::AnalyticsContext,
     approvals::{Approvals, executor_approvals::ExecutorApprovalBridge},
     config::{Config, DEFAULT_COMMIT_REMINDER_PROMPT},
-    container::{ContainerError, ContainerRef, ContainerService},
+    container::{ContainerError, ContainerRef, ContainerService, SessionStartLocks},
     diff_stream::{self, DiffStreamHandle},
     file::FileService,
     notification::NotificationService,
@@ -74,6 +77,12 @@ const WORKSPACE_TOUCH_DEBOUNCE: Duration = Duration::from_mins(2);
 const MAX_AUTO_CONTINUE_RETRIES: u32 = 3;
 /// Backoff before resuming a session after a transient API stall.
 const AUTO_CONTINUE_BACKOFF: Duration = Duration::from_secs(2);
+/// Pause before starting a fresh process for an agent that stopped answering,
+/// after the old process group has been killed. Stop can cancel it.
+const UNRESPONSIVE_AGENT_RESTART_BACKOFF: Duration = Duration::from_secs(2);
+/// How long to wait for a pending exit signal once the agent process exited on
+/// its own. Covers executor cleanup, e.g. stopping background task groups.
+const EXIT_SIGNAL_GRACE: Duration = Duration::from_secs(5);
 
 /// True while the auto-continue chain is still under the retry cap.
 fn under_retry_cap(attempts: u32) -> bool {
@@ -86,6 +95,7 @@ pub struct LocalContainerService {
     workspace_manager: WorkspaceManager,
     child_store: Arc<RwLock<HashMap<Uuid, Arc<RwLock<AsyncGroupChild>>>>>,
     cancellation_tokens: Arc<RwLock<HashMap<Uuid, CancellationToken>>>,
+    session_start_locks: SessionStartLocks,
     msg_stores: Arc<RwLock<HashMap<Uuid, Arc<MsgStore>>>>,
     /// Tracks background tasks that stream logs to the database.
     /// When stopping execution, we await these to ensure logs are fully persisted.
@@ -131,6 +141,7 @@ impl LocalContainerService {
             workspace_manager,
             child_store,
             cancellation_tokens,
+            session_start_locks: SessionStartLocks::default(),
             msg_stores,
             db_stream_handles,
             exit_monitor_handles,
@@ -536,11 +547,15 @@ impl LocalContainerService {
         let mut process_exit_rx = self.spawn_os_exit_watcher(exec_id);
 
         tokio::spawn(async move {
+            let has_exit_signal = exit_signal.is_some();
             let mut exit_signal_future = exit_signal
                 .map(|rx| rx.boxed()) // wait for result
                 .unwrap_or_else(|| std::future::pending().boxed()); // no signal, stall forever
 
-            let status_result: std::io::Result<std::process::ExitStatus>;
+            let mut status_result: std::io::Result<std::process::ExitStatus>;
+            // Agent session to resume when the executor asked for a fresh agent
+            // process instead of failing outright.
+            let mut restart_session: Option<String> = None;
 
             // Wait for process to exit, or exit signal from executor
             tokio::select! {
@@ -560,14 +575,40 @@ impl LocalContainerService {
                     status_result = match exit_result {
                         Ok(ExecutorExitResult::Success) => Ok(success_exit_status()),
                         Ok(ExecutorExitResult::Failure) => Ok(failure_exit_status()),
+                        Ok(ExecutorExitResult::RestartRequested { session_id }) => {
+                            restart_session = Some(session_id);
+                            Ok(failure_exit_status())
+                        }
                         Err(_) => Ok(success_exit_status()), // Channel closed, assume success
                     };
                 }
                 // Process exit
                 exit_status_result = &mut process_exit_rx => {
                     status_result = exit_status_result.unwrap_or_else(|e| Err(std::io::Error::other(e)));
+                    // The executor cleans up (cancelling the session, stopping
+                    // background tasks) before signalling, and the agent may
+                    // exit meanwhile. Don't lose a restart request to that race.
+                    if has_exit_signal
+                        && let Ok(Ok(ExecutorExitResult::RestartRequested { session_id })) =
+                            tokio::time::timeout(EXIT_SIGNAL_GRACE, &mut exit_signal_future).await
+                    {
+                        restart_session = Some(session_id);
+                        status_result = Ok(failure_exit_status());
+                    }
                 }
             }
+
+            // Decide on a restart before recording completion: the interrupted
+            // run stays Running, and so stoppable, until the replacement starts.
+            let restart_requested = restart_session.is_some();
+            let restarted = match restart_session.clone() {
+                Some(agent_session_id) => {
+                    container
+                        .try_restart_unresponsive_agent(exec_id, agent_session_id)
+                        .await
+                }
+                None => false,
+            };
 
             let (exit_code, status) = match status_result {
                 Ok(exit_status) => {
@@ -614,7 +655,8 @@ impl LocalContainerService {
                         ExecutionProcessStatus::Running
                     );
 
-                    let mut already_finalized = false;
+                    // A replacement process now continues the session.
+                    let mut already_finalized = restarted;
 
                     if success || cleanup_done {
                         // Commit changes (if any) and get feedback about whether changes were made
@@ -761,13 +803,16 @@ impl LocalContainerService {
 
                         // Only execute queued messages if the execution succeeded.
                         // If it failed or was killed, just clear the queue and finalize —
-                        // EXCEPT a retryable API stall, which is a transient interruption
-                        // rather than a real failure, so the user's queued message should
-                        // still run (resuming the session) instead of being discarded.
+                        // EXCEPT a retryable API stall or an agent that asked to be
+                        // restarted, which are transient interruptions rather than real
+                        // failures, so the user's queued message should still run
+                        // (resuming the session) instead of being discarded.
                         let should_execute_queued = !matches!(
                             ctx.execution_process.status,
                             ExecutionProcessStatus::Failed | ExecutionProcessStatus::Killed
-                        ) || ended_in_retryable_stall;
+                        ) || ended_in_retryable_stall
+                            || (restart_requested
+                                && ctx.execution_process.status != ExecutionProcessStatus::Killed);
 
                         if let Some(queued_msg) =
                             container.queued_message_service.take_queued(ctx.session.id)
@@ -794,7 +839,11 @@ impl LocalContainerService {
 
                                 // Execute the queued follow-up
                                 if let Err(e) = container
-                                    .start_queued_follow_up(&ctx, &queued_msg.data)
+                                    .start_queued_follow_up(
+                                        &ctx,
+                                        &queued_msg.data,
+                                        restart_session.as_deref(),
+                                    )
                                     .await
                                 {
                                     tracing::error!("Failed to start queued follow-up: {}", e);
@@ -875,7 +924,11 @@ impl LocalContainerService {
                             }
 
                             if let Err(e) = container
-                                .start_queued_follow_up(&ctx, &queued_msg.data)
+                                .start_queued_follow_up(
+                                    &ctx,
+                                    &queued_msg.data,
+                                    restart_session.as_deref(),
+                                )
                                 .await
                             {
                                 tracing::error!(
@@ -1377,6 +1430,7 @@ impl LocalContainerService {
         &self,
         ctx: &ExecutionContext,
         queued_data: &DraftFollowUpData,
+        restart_session_id: Option<&str>,
     ) -> Result<ExecutionProcess, ContainerError> {
         let executor_profile_id = queued_data.executor_config.profile_id();
 
@@ -1403,9 +1457,14 @@ impl LocalContainerService {
             .await?;
         }
 
-        // Get latest agent turn for session continuity (from coding agent turns)
-        let latest_session_info =
-            CodingAgentTurn::find_latest_session_info(&self.db.pool, ctx.session.id).await?;
+        // The restart signal is authoritative even before SessionStart has
+        // reached database persistence. Only ordinary queued runs need a lookup.
+        let agent_session_id = match restart_session_id {
+            Some(session_id) => Some(session_id.to_owned()),
+            None => CodingAgentTurn::find_latest_session_info(&self.db.pool, ctx.session.id)
+                .await?
+                .map(|info| info.session_id),
+        };
 
         let repos =
             WorkspaceRepo::find_repos_for_workspace(&self.db.pool, ctx.workspace.id).await?;
@@ -1418,21 +1477,7 @@ impl LocalContainerService {
             .filter(|dir| !dir.is_empty())
             .cloned();
 
-        let action_type = if let Some(info) = latest_session_info {
-            ExecutorActionType::CodingAgentFollowUpRequest(CodingAgentFollowUpRequest {
-                prompt: queued_data.message.clone(),
-                session_id: info.session_id,
-                reset_to_message_id: None,
-                executor_config: queued_data.executor_config.clone(),
-                working_dir: working_dir.clone(),
-            })
-        } else {
-            ExecutorActionType::CodingAgentInitialRequest(CodingAgentInitialRequest {
-                prompt: queued_data.message.clone(),
-                executor_config: queued_data.executor_config.clone(),
-                working_dir,
-            })
-        };
+        let action_type = queued_follow_up_action(queued_data, agent_session_id, working_dir);
 
         let action = ExecutorAction::new(action_type, cleanup_action.map(Box::new));
 
@@ -1451,10 +1496,9 @@ impl LocalContainerService {
         &self,
         ctx: &ExecutionContext,
     ) -> Result<ExecutionProcess, ContainerError> {
-        // AUTO_CONTINUE_PROMPT is the shared module-level const defined in Task 5 —
-        // the counter reads it to identify prior auto-continues, so both must use
-        // the exact same string. Do NOT redefine it locally.
-
+        // AUTO_CONTINUE_PROMPT is the shared module-level const — the counter reads
+        // it to identify prior auto-continues, so both must use the exact same
+        // string. Do NOT redefine it locally.
         let latest_session_info =
             CodingAgentTurn::find_latest_session_info(&self.db.pool, ctx.session.id).await?;
         let Some(info) = latest_session_info else {
@@ -1463,40 +1507,168 @@ impl LocalContainerService {
                 ctx.session.id
             )));
         };
+        let start_guard = self.session_start_locks.lock(ctx.session.id).await;
+        self.start_resume_follow_up(ctx, AUTO_CONTINUE_PROMPT, info.session_id, &start_guard)
+            .await
+    }
 
-        // Reuse the interrupted run's own executor config (same profile/model).
-        let action = ctx.execution_process.executor_action()?;
-        let executor_config = match action.typ() {
-            ExecutorActionType::CodingAgentFollowUpRequest(r) => r.executor_config.clone(),
-            ExecutorActionType::CodingAgentInitialRequest(r) => r.executor_config.clone(),
-            _ => {
-                return Err(ContainerError::Other(anyhow!(
-                    "cannot auto-continue: last action is not a coding-agent request"
-                )));
+    /// Replace an agent process that stopped answering prompts with a fresh one
+    /// resuming `agent_session_id`. Called before the interrupted run is
+    /// marked finished, so it is still Running and Stop can cancel the pending
+    /// restart. Returns true if the replacement started; the interrupted run is
+    /// then already marked failed.
+    async fn try_restart_unresponsive_agent(
+        &self,
+        exec_id: Uuid,
+        agent_session_id: String,
+    ) -> bool {
+        // Stop cancels the interrupted run's token; without one, rely on the
+        // status checks below.
+        let cancel = self
+            .cancellation_tokens
+            .read()
+            .await
+            .get(&exec_id)
+            .cloned()
+            .unwrap_or_default();
+        tokio::select! {
+            _ = cancel.cancelled() => {
+                tracing::info!("Agent restart for execution {exec_id} cancelled");
+                return false;
+            }
+            _ = tokio::time::sleep(UNRESPONSIVE_AGENT_RESTART_BACKOFF) => {}
+        }
+
+        let session_id = match ExecutionProcess::find_by_id(&self.db.pool, exec_id).await {
+            Ok(Some(proc)) => proc.session_id,
+            Ok(None) => return false,
+            Err(e) => {
+                tracing::error!("Cannot restart agent for execution {exec_id}: {e}");
+                return false;
             }
         };
+        // Hold the session's start lock from the eligibility check until the
+        // replacement is recorded, so no other start lands in between and
+        // workspace-wide stops see either the old run or the replacement.
+        let Some(start_guard) = self
+            .session_start_locks
+            .lock_unless_cancelled(session_id, &cancel)
+            .await
+        else {
+            tracing::info!("Agent restart for execution {exec_id} cancelled");
+            return false;
+        };
 
+        let ctx = match ExecutionProcess::load_context(&self.db.pool, exec_id).await {
+            Ok(ctx) => ctx,
+            Err(e) => {
+                tracing::error!("Cannot restart agent for execution {exec_id}: {e}");
+                return false;
+            }
+        };
+        let session_processes = match ExecutionProcess::find_by_session_id(
+            &self.db.pool,
+            ctx.session.id,
+            false,
+        )
+        .await
+        {
+            Ok(processes) => processes,
+            Err(e) => {
+                tracing::error!("Cannot restart agent for execution {exec_id}: {e}");
+                return false;
+            }
+        };
+        if let Err(skip) = check_unresponsive_agent_restart(
+            &ctx.execution_process,
+            &session_processes,
+            self.queued_message_service.has_queued(ctx.session.id),
+        ) {
+            tracing::info!("Not restarting agent for execution {exec_id}: {skip:?}");
+            return false;
+        }
+
+        // Finish the interrupted run first, unless a stop got there first, so
+        // the session never shows two running agents.
+        match ExecutionProcess::mark_failed_if_running(&self.db.pool, exec_id, Some(1)).await {
+            Ok(true) if !cancel.is_cancelled() => {}
+            Ok(_) => {
+                tracing::info!("Agent restart for execution {exec_id} cancelled");
+                return false;
+            }
+            Err(e) => {
+                tracing::error!("Cannot restart agent for execution {exec_id}: {e}");
+                return false;
+            }
+        }
+
+        tracing::info!(
+            "Restarting unresponsive agent for session {} after execution {exec_id}",
+            ctx.session.id
+        );
+        let replacement = match self
+            .start_resume_follow_up(
+                &ctx,
+                UNRESPONSIVE_AGENT_RESTART_PROMPT,
+                agent_session_id,
+                &start_guard,
+            )
+            .await
+        {
+            Ok(replacement) => replacement,
+            Err(e) => {
+                tracing::error!(
+                    "Failed to restart unresponsive agent for session {}: {e}",
+                    ctx.session.id
+                );
+                return false;
+            }
+        };
+        drop(start_guard);
+
+        // Keep forwarding cancellation for the replacement's entire lifetime,
+        // including stops arriving after this handoff has returned.
+        if let Some(store) = self.msg_stores.read().await.get(&replacement.id).cloned() {
+            let container = self.clone();
+            tokio::spawn(async move {
+                if cancelled_before_finished(&cancel, &store).await
+                    && let Ok(Some(process)) =
+                        ExecutionProcess::find_by_id(&container.db.pool, replacement.id).await
+                    && process.status == ExecutionProcessStatus::Running
+                    && let Err(e) = container
+                        .stop_execution(&process, ExecutionProcessStatus::Killed)
+                        .await
+                {
+                    tracing::error!("Failed to stop replacement {}: {e}", replacement.id);
+                }
+            });
+        }
+        true
+    }
+
+    /// Start a follow-up that resumes `agent_session_id` with `prompt`, using
+    /// the interrupted run's own executor config (profile, model, mode,
+    /// permissions) and working directory. The caller holds the session's
+    /// start lock, typically since checking that the resume is still wanted.
+    async fn start_resume_follow_up(
+        &self,
+        ctx: &ExecutionContext,
+        prompt: &str,
+        agent_session_id: String,
+        _start_guard: &tokio::sync::OwnedMutexGuard<()>,
+    ) -> Result<ExecutionProcess, ContainerError> {
         let repos =
             WorkspaceRepo::find_repos_for_workspace(&self.db.pool, ctx.workspace.id).await?;
         let cleanup_action = self.cleanup_actions_for_repos(&repos);
-        let working_dir = ctx
-            .session
-            .agent_working_dir
-            .as_ref()
-            .filter(|dir| !dir.is_empty())
-            .cloned();
 
-        let action_type =
-            ExecutorActionType::CodingAgentFollowUpRequest(CodingAgentFollowUpRequest {
-                prompt: AUTO_CONTINUE_PROMPT.to_string(),
-                session_id: info.session_id,
-                reset_to_message_id: None,
-                executor_config,
-                working_dir,
-            });
+        let action_type = resume_follow_up_action(
+            ctx.execution_process.executor_action()?,
+            agent_session_id,
+            prompt,
+        )?;
         let new_action = ExecutorAction::new(action_type, cleanup_action.map(Box::new));
 
-        self.start_execution(
+        self.start_execution_locked(
             &ctx.workspace,
             &ctx.session,
             &new_action,
@@ -1534,6 +1706,10 @@ impl ContainerService for LocalContainerService {
 
     fn msg_stores(&self) -> &Arc<RwLock<HashMap<Uuid, Arc<MsgStore>>>> {
         &self.msg_stores
+    }
+
+    fn session_start_locks(&self) -> &SessionStartLocks {
+        &self.session_start_locks
     }
 
     fn db(&self) -> &DBService {
@@ -2058,6 +2234,152 @@ fn success_exit_status() -> std::process::ExitStatus {
 /// API stall. Also the durable marker used to count consecutive auto-continues.
 pub(crate) const AUTO_CONTINUE_PROMPT: &str = "Please continue from where you were interrupted.";
 
+/// Forward a stop only while the replacement is alive; release the watcher
+/// after its log is finished, and never turn an already completed run into Killed.
+async fn cancelled_before_finished(cancel: &CancellationToken, store: &MsgStore) -> bool {
+    // Subscribe before checking history so a concurrent Finished cannot fall
+    // between the history snapshot and the live subscription.
+    let mut events = store.get_receiver();
+    if store.is_finished() {
+        return false;
+    }
+    tokio::select! {
+        biased;
+        _ = async {
+            loop {
+                match events.recv().await {
+                    Ok(LogMsg::Finished) | Err(tokio::sync::broadcast::error::RecvError::Closed) => break,
+                    _ => {}
+                }
+                if store.is_finished() { break; }
+            }
+        } => false,
+        _ = cancel.cancelled() => !store.is_finished(),
+    }
+}
+
+fn queued_follow_up_action(
+    queued: &DraftFollowUpData,
+    session_id: Option<String>,
+    working_dir: Option<String>,
+) -> ExecutorActionType {
+    match session_id {
+        Some(session_id) => {
+            ExecutorActionType::CodingAgentFollowUpRequest(CodingAgentFollowUpRequest {
+                prompt: queued.message.clone(),
+                session_id,
+                reset_to_message_id: None,
+                executor_config: queued.executor_config.clone(),
+                working_dir,
+            })
+        }
+        None => ExecutorActionType::CodingAgentInitialRequest(CodingAgentInitialRequest {
+            prompt: queued.message.clone(),
+            executor_config: queued.executor_config.clone(),
+            working_dir,
+        }),
+    }
+}
+
+/// Follow-up that resumes `session_id` with `prompt`, keeping the executor
+/// config and working directory of the interrupted coding-agent action.
+fn resume_follow_up_action(
+    interrupted: &ExecutorAction,
+    session_id: String,
+    prompt: &str,
+) -> Result<ExecutorActionType, ContainerError> {
+    let (executor_config, working_dir) = match interrupted.typ() {
+        ExecutorActionType::CodingAgentFollowUpRequest(r) => {
+            (r.executor_config.clone(), r.working_dir.clone())
+        }
+        ExecutorActionType::CodingAgentInitialRequest(r) => {
+            (r.executor_config.clone(), r.working_dir.clone())
+        }
+        _ => {
+            return Err(ContainerError::Other(anyhow!(
+                "cannot resume: last action is not a coding-agent request"
+            )));
+        }
+    };
+    Ok(ExecutorActionType::CodingAgentFollowUpRequest(
+        CodingAgentFollowUpRequest {
+            prompt: prompt.to_string(),
+            session_id,
+            reset_to_message_id: None,
+            executor_config,
+            working_dir,
+        },
+    ))
+}
+
+/// True if this process was started to replace an unresponsive agent.
+fn is_unresponsive_agent_restart_process(proc: &ExecutionProcess) -> bool {
+    proc.executor_action()
+        .ok()
+        .map(|action| {
+            matches!(
+                action.typ(),
+                ExecutorActionType::CodingAgentFollowUpRequest(req)
+                    if is_unresponsive_agent_restart_prompt(&req.prompt)
+            )
+        })
+        .unwrap_or(false)
+}
+
+/// Why an unresponsive agent is not restarted.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum RestartSkip {
+    NotCodingAgent,
+    /// The run was stopped, or otherwise finished, during the pause.
+    NoLongerRunning,
+    /// The user queued a message, which resumes the session instead.
+    FollowUpQueued,
+    /// Another coding-agent run started in the session after this one.
+    Superseded,
+    /// The automatic recovery chain already used its one restart.
+    AlreadyRestarted,
+}
+
+/// Whether `proc`, whose agent asked to be restarted and has not been marked
+/// finished yet, should be replaced. `session_processes` are the session's
+/// non-dropped processes, oldest first.
+fn check_unresponsive_agent_restart(
+    proc: &ExecutionProcess,
+    session_processes: &[ExecutionProcess],
+    follow_up_queued: bool,
+) -> Result<(), RestartSkip> {
+    if proc.run_reason != ExecutionProcessRunReason::CodingAgent {
+        return Err(RestartSkip::NotCodingAgent);
+    }
+    if proc.status != ExecutionProcessStatus::Running {
+        return Err(RestartSkip::NoLongerRunning);
+    }
+    if follow_up_queued {
+        return Err(RestartSkip::FollowUpQueued);
+    }
+    let coding_agents = session_processes
+        .iter()
+        .filter(|p| p.run_reason == ExecutionProcessRunReason::CodingAgent);
+    if coding_agents.clone().next_back().map(|p| p.id) != Some(proc.id)
+        || coding_agents
+            .clone()
+            .any(|p| p.id != proc.id && p.status == ExecutionProcessStatus::Running)
+    {
+        return Err(RestartSkip::Superseded);
+    }
+    // Walk back through the automatic runs that led here; the chain ends at
+    // the last run the user started.
+    for p in coding_agents.rev() {
+        if is_unresponsive_agent_restart_process(p) {
+            return Err(RestartSkip::AlreadyRestarted);
+        }
+        if !is_auto_continue_process(p) {
+            break;
+        }
+    }
+    Ok(())
+}
+
 /// True if this process is an auto-continue follow-up (its executor action is a
 /// coding-agent follow-up carrying the `AUTO_CONTINUE_PROMPT` sentinel).
 fn is_auto_continue_process(proc: &ExecutionProcess) -> bool {
@@ -2157,5 +2479,309 @@ mod retryable_stall_tests {
         // After #3 failed: 3 → BLOCKED (must NOT spawn a 4th).
         assert!(!under_retry_cap(3));
         assert!(!under_retry_cap(4));
+    }
+}
+
+#[cfg(test)]
+mod unresponsive_agent_restart_tests {
+    use executors::profile::ExecutorConfig;
+
+    use super::*;
+
+    const USER_PROMPT: &str = "analyze the file";
+
+    fn kimi_config() -> ExecutorConfig {
+        ExecutorConfig {
+            variant: Some("PLAN".into()),
+            model_id: Some("kimi-k2".into()),
+            agent_id: Some("code".into()),
+            reasoning_id: Some("high".into()),
+            permission_policy: Some(executors::model_selector::PermissionPolicy::Supervised),
+            ..ExecutorConfig::new(BaseCodingAgent::KimiCode)
+        }
+    }
+
+    fn follow_up(prompt: &str) -> ExecutorAction {
+        ExecutorAction::new(
+            ExecutorActionType::CodingAgentFollowUpRequest(CodingAgentFollowUpRequest {
+                prompt: prompt.into(),
+                session_id: "earlier-session".into(),
+                reset_to_message_id: Some("checkpoint".into()),
+                executor_config: kimi_config(),
+                working_dir: Some("app".into()),
+            }),
+            None,
+        )
+    }
+
+    fn process(
+        action: ExecutorAction,
+        run_reason: ExecutionProcessRunReason,
+        status: ExecutionProcessStatus,
+    ) -> ExecutionProcess {
+        // Built through serde: this crate does not depend on sqlx or chrono.
+        let now = "2026-01-01T00:00:00Z";
+        serde_json::from_value(json!({
+            "id": Uuid::new_v4(),
+            "session_id": Uuid::new_v4(),
+            "run_reason": run_reason,
+            "executor_action": action,
+            "status": status,
+            "exit_code": null,
+            "dropped": false,
+            "started_at": now,
+            "completed_at": null,
+            "created_at": now,
+            "updated_at": now,
+        }))
+        .unwrap()
+    }
+
+    fn agent(prompt: &str, status: ExecutionProcessStatus) -> ExecutionProcess {
+        process(
+            follow_up(prompt),
+            ExecutionProcessRunReason::CodingAgent,
+            status,
+        )
+    }
+
+    /// The run whose agent asked to be restarted; not yet marked finished.
+    fn interrupted(prompt: &str) -> ExecutionProcess {
+        agent(prompt, ExecutionProcessStatus::Running)
+    }
+
+    fn earlier_user_turn() -> ExecutionProcess {
+        agent("earlier request", ExecutionProcessStatus::Completed)
+    }
+
+    fn check(proc: &ExecutionProcess, earlier: &[ExecutionProcess]) -> Result<(), RestartSkip> {
+        let mut session = earlier.to_vec();
+        session.push(proc.clone());
+        check_unresponsive_agent_restart(proc, &session, false)
+    }
+
+    #[test]
+    fn restarts_latest_running_agent_that_requested_it() {
+        let proc = interrupted(USER_PROMPT);
+        assert_eq!(check(&proc, &[earlier_user_turn()]), Ok(()));
+    }
+
+    #[test]
+    fn stop_during_pause_prevents_restart() {
+        // Stop marks the interrupted run killed while the restart is pending.
+        for status in [
+            ExecutionProcessStatus::Killed,
+            ExecutionProcessStatus::Completed,
+            ExecutionProcessStatus::Failed,
+        ] {
+            let proc = agent(USER_PROMPT, status.clone());
+            assert_eq!(
+                check(&proc, &[]),
+                Err(RestartSkip::NoLongerRunning),
+                "{status:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn queued_user_message_takes_precedence() {
+        let proc = interrupted(USER_PROMPT);
+        assert_eq!(
+            check_unresponsive_agent_restart(&proc, std::slice::from_ref(&proc), true),
+            Err(RestartSkip::FollowUpQueued)
+        );
+    }
+
+    #[test]
+    fn newer_user_follow_up_supersedes_restart() {
+        let proc = interrupted(USER_PROMPT);
+        // A follow-up that started, or even finished, during the pause.
+        for newer_status in [
+            ExecutionProcessStatus::Running,
+            ExecutionProcessStatus::Completed,
+        ] {
+            let session = vec![
+                earlier_user_turn(),
+                proc.clone(),
+                agent("user follow-up", newer_status),
+            ];
+            assert_eq!(
+                check_unresponsive_agent_restart(&proc, &session, false),
+                Err(RestartSkip::Superseded)
+            );
+        }
+        // Another agent still running in the session, whatever its order.
+        let other = agent("parallel", ExecutionProcessStatus::Running);
+        assert_eq!(check(&proc, &[other]), Err(RestartSkip::Superseded));
+    }
+
+    #[test]
+    fn dropped_interrupted_run_is_not_restarted() {
+        // A reset during the pause drops the run from the session listing.
+        let proc = interrupted(USER_PROMPT);
+        assert_eq!(
+            check_unresponsive_agent_restart(&proc, &[earlier_user_turn()], false),
+            Err(RestartSkip::Superseded)
+        );
+    }
+
+    #[test]
+    fn restart_happens_at_most_once() {
+        // The replacement process itself asking again ends the chain.
+        let restarted = interrupted(&format!("{UNRESPONSIVE_AGENT_RESTART_PROMPT} suffix"));
+        assert!(is_unresponsive_agent_restart_process(&restarted));
+        assert_eq!(
+            check(&restarted, &[earlier_user_turn()]),
+            Err(RestartSkip::AlreadyRestarted)
+        );
+    }
+
+    #[test]
+    fn restart_limit_survives_auto_continue_descendants() {
+        let restart = agent(
+            UNRESPONSIVE_AGENT_RESTART_PROMPT,
+            ExecutionProcessStatus::Failed,
+        );
+        let auto_continue = agent(AUTO_CONTINUE_PROMPT, ExecutionProcessStatus::Failed);
+        let proc = interrupted(AUTO_CONTINUE_PROMPT);
+        assert_eq!(
+            check(&proc, &[earlier_user_turn(), restart, auto_continue]),
+            Err(RestartSkip::AlreadyRestarted)
+        );
+    }
+
+    #[test]
+    fn new_user_turn_gets_a_fresh_restart() {
+        let restart = agent(
+            UNRESPONSIVE_AGENT_RESTART_PROMPT,
+            ExecutionProcessStatus::Completed,
+        );
+        let proc = interrupted("next user request");
+        assert_eq!(check(&proc, &[earlier_user_turn(), restart]), Ok(()));
+    }
+
+    #[test]
+    fn non_agent_runs_do_not_restart() {
+        let proc = process(
+            follow_up(USER_PROMPT),
+            ExecutionProcessRunReason::MergeCommitMessage,
+            ExecutionProcessStatus::Running,
+        );
+        assert_eq!(check(&proc, &[]), Err(RestartSkip::NotCodingAgent));
+    }
+
+    #[test]
+    fn restart_resumes_given_session_with_same_settings_and_diagnostic_prompt() {
+        let typ = resume_follow_up_action(
+            &follow_up(USER_PROMPT),
+            "interrupted-display-session".into(),
+            UNRESPONSIVE_AGENT_RESTART_PROMPT,
+        )
+        .unwrap();
+
+        let ExecutorActionType::CodingAgentFollowUpRequest(req) = typ else {
+            panic!("restart must be a follow-up");
+        };
+        assert_eq!(req.session_id, "interrupted-display-session");
+        // Only the diagnostic prompt is sent; the original is never replayed.
+        assert_eq!(req.prompt, UNRESPONSIVE_AGENT_RESTART_PROMPT);
+        assert!(!req.prompt.contains(USER_PROMPT));
+        // Resume from the session head, not an older checkpoint.
+        assert_eq!(req.reset_to_message_id, None);
+        assert_eq!(req.executor_config, kimi_config());
+        // The interrupted run's directory, not the session's current one.
+        assert_eq!(req.working_dir.as_deref(), Some("app"));
+    }
+
+    #[test]
+    fn resume_keeps_initial_request_settings() {
+        let action = ExecutorAction::new(
+            ExecutorActionType::CodingAgentInitialRequest(CodingAgentInitialRequest {
+                prompt: USER_PROMPT.into(),
+                executor_config: kimi_config(),
+                working_dir: Some("packages/api".into()),
+            }),
+            None,
+        );
+        let ExecutorActionType::CodingAgentFollowUpRequest(req) = resume_follow_up_action(
+            &action,
+            "first-session".into(),
+            UNRESPONSIVE_AGENT_RESTART_PROMPT,
+        )
+        .unwrap() else {
+            panic!("restart must be a follow-up");
+        };
+        assert_eq!(req.session_id, "first-session");
+        assert_eq!(req.executor_config, kimi_config());
+        assert_eq!(req.working_dir.as_deref(), Some("packages/api"));
+    }
+}
+
+#[cfg(test)]
+mod recovery_handoff_tests {
+    use super::*;
+
+    #[tokio::test]
+    async fn cancellation_remains_linked_after_handoff() {
+        let cancel = CancellationToken::new();
+        let store = Arc::new(MsgStore::new());
+        let watcher = {
+            let cancel = cancel.clone();
+            let store = store.clone();
+            tokio::spawn(async move { cancelled_before_finished(&cancel, &store).await })
+        };
+        tokio::task::yield_now().await;
+        cancel.cancel();
+        assert!(
+            tokio::time::timeout(Duration::from_secs(1), watcher)
+                .await
+                .unwrap()
+                .unwrap()
+        );
+    }
+
+    #[tokio::test]
+    async fn completed_replacement_releases_watcher_without_forwarding_stop() {
+        let cancel = CancellationToken::new();
+        let store = MsgStore::new();
+        store.push_finished();
+        cancel.cancel();
+        assert!(!cancelled_before_finished(&cancel, &store).await);
+    }
+
+    #[tokio::test]
+    async fn normal_completion_releases_live_watcher() {
+        let cancel = CancellationToken::new();
+        let store = Arc::new(MsgStore::new());
+        let watcher = {
+            let store = store.clone();
+            tokio::spawn(async move { cancelled_before_finished(&cancel, &store).await })
+        };
+        tokio::task::yield_now().await;
+        store.push_finished();
+        assert!(
+            !tokio::time::timeout(Duration::from_secs(1), watcher)
+                .await
+                .unwrap()
+                .unwrap()
+        );
+    }
+
+    #[test]
+    fn queued_recovery_keeps_exact_session_and_user_request() {
+        let queued: DraftFollowUpData = serde_json::from_value(serde_json::json!({
+            "message": "Report existing results", "executor_config": {"executor": "KIMI_CODE", "variant": "DEFAULT"}
+        })).unwrap();
+        let ExecutorActionType::CodingAgentFollowUpRequest(request) = queued_follow_up_action(
+            &queued,
+            Some("exact-unpersisted-session".into()),
+            Some("repo".into()),
+        ) else {
+            panic!("must resume instead of starting a new session")
+        };
+        assert_eq!(request.session_id, "exact-unpersisted-session");
+        assert_eq!(request.prompt, queued.message);
+        assert_eq!(request.executor_config, queued.executor_config);
+        assert_eq!(request.working_dir.as_deref(), Some("repo"));
     }
 }

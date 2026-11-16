@@ -155,6 +155,9 @@ impl From<ContainerError> for ApiError {
             ContainerError::ExecutionProcess(e) => ApiError::ExecutionProcess(e),
             ContainerError::ExecutorError(e) => ApiError::Executor(e),
             ContainerError::Worktree(e) => e.into(),
+            ContainerError::CodingAgentAlreadyRunning => {
+                ApiError::Conflict(ContainerError::CodingAgentAlreadyRunning.to_string())
+            }
             other => ApiError::Container(other),
         }
     }

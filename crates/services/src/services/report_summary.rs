@@ -400,7 +400,10 @@ async fn run_in_dir(
         match exit_signal {
             Some(signal) => {
                 tokio::select! {
-                    result = signal => !matches!(result, Ok(ExecutorExitResult::Failure)),
+                    result = signal => !matches!(
+                        result,
+                        Ok(ExecutorExitResult::Failure | ExecutorExitResult::RestartRequested { .. })
+                    ),
                     status = spawned.child.wait() => status.map(|s| s.success()).unwrap_or(false),
                 }
             }

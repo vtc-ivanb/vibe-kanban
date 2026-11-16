@@ -84,8 +84,54 @@ pub enum ContainerError {
     Io(#[from] std::io::Error),
     #[error("Failed to kill process: {0}")]
     KillFailed(std::io::Error),
+    #[error("A coding agent is already running in this session")]
+    CodingAgentAlreadyRunning,
     #[error(transparent)]
     Other(#[from] AnyhowError), // Catches any unclassified errors
+}
+
+/// Per-session locks serializing execution starts, so checking a session's
+/// state and starting an execution in it happen without another start in
+/// between. Entries live only while someone holds or waits for the lock.
+#[derive(Clone, Default)]
+pub struct SessionStartLocks {
+    locks: Arc<std::sync::Mutex<HashMap<Uuid, std::sync::Weak<tokio::sync::Mutex<()>>>>>,
+}
+
+impl SessionStartLocks {
+    fn session_lock(&self, session_id: Uuid) -> Arc<tokio::sync::Mutex<()>> {
+        let mut locks = self.locks.lock().unwrap();
+        if let Some(lock) = locks.get(&session_id).and_then(std::sync::Weak::upgrade) {
+            return lock;
+        }
+        locks.retain(|_, lock| lock.strong_count() > 0);
+        let lock = Arc::new(tokio::sync::Mutex::new(()));
+        locks.insert(session_id, Arc::downgrade(&lock));
+        lock
+    }
+
+    /// Wait for the session's start lock. Not reentrant.
+    pub async fn lock(&self, session_id: Uuid) -> tokio::sync::OwnedMutexGuard<()> {
+        self.session_lock(session_id).lock_owned().await
+    }
+
+    /// Like [`lock`](Self::lock), but gives up once `cancel` is cancelled.
+    pub async fn lock_unless_cancelled(
+        &self,
+        session_id: Uuid,
+        cancel: &executors::executors::CancellationToken,
+    ) -> Option<tokio::sync::OwnedMutexGuard<()>> {
+        tokio::select! {
+            biased;
+            _ = cancel.cancelled() => None,
+            guard = self.lock(session_id) => Some(guard),
+        }
+    }
+
+    #[cfg(test)]
+    fn tracked_sessions(&self) -> usize {
+        self.locks.lock().unwrap().len()
+    }
 }
 
 #[async_trait]
@@ -101,6 +147,11 @@ pub trait ContainerService {
     }
 
     fn msg_stores(&self) -> &Arc<RwLock<HashMap<Uuid, Arc<MsgStore>>>>;
+
+    /// Locks serializing execution starts per session; see [`start_execution`].
+    ///
+    /// [`start_execution`]: ContainerService::start_execution
+    fn session_start_locks(&self) -> &SessionStartLocks;
 
     fn db(&self) -> &DBService;
 
@@ -818,6 +869,9 @@ pub trait ContainerService {
         };
 
         for session in sessions {
+            // Hold the start lock so a process starting concurrently (e.g. an
+            // automatic restart) is either listed here or not started at all.
+            let _start_guard = self.session_start_locks().lock(session.id).await;
             if let Ok(processes) =
                 ExecutionProcess::find_by_session_id(&self.db().pool, session.id, false).await
             {
@@ -1254,6 +1308,8 @@ pub trait ContainerService {
         Ok(execution_process)
     }
 
+    /// Start an execution in `session`. Starts in one session are serialized,
+    /// and a coding agent is not started while another one is running there.
     async fn start_execution(
         &self,
         workspace: &Workspace,
@@ -1261,6 +1317,33 @@ pub trait ContainerService {
         executor_action: &ExecutorAction,
         run_reason: &ExecutionProcessRunReason,
     ) -> Result<ExecutionProcess, ContainerError> {
+        let _start_guard = self.session_start_locks().lock(session.id).await;
+        self.start_execution_locked(workspace, session, executor_action, run_reason)
+            .await
+    }
+
+    /// [`start_execution`] for callers already holding the session's start
+    /// lock, so they can check the session and start without anyone starting
+    /// in between. Calling it without the lock bypasses that serialization;
+    /// calling [`start_execution`] with it held deadlocks.
+    ///
+    /// [`start_execution`]: ContainerService::start_execution
+    async fn start_execution_locked(
+        &self,
+        workspace: &Workspace,
+        session: &Session,
+        executor_action: &ExecutorAction,
+        run_reason: &ExecutionProcessRunReason,
+    ) -> Result<ExecutionProcess, ContainerError> {
+        // One coding agent per session: a second one would act on the same
+        // agent session and worktree concurrently. Scripts may run alongside.
+        if *run_reason == ExecutionProcessRunReason::CodingAgent
+            && ExecutionProcess::has_running_coding_agent_for_session(&self.db().pool, session.id)
+                .await?
+        {
+            return Err(ContainerError::CodingAgentAlreadyRunning);
+        }
+
         // Create new execution process record
         // Capture current HEAD per repository as the "before" commit for this execution
         let repositories =
@@ -1526,7 +1609,122 @@ fn setup_required_entry(program: &str) -> NormalizedEntry {
 
 #[cfg(test)]
 mod tests {
+    use std::time::Duration;
+
     use super::*;
+
+    /// A start as `start_execution` does it: check that no coding agent is
+    /// running, then record one, with awaits in between like the real DB
+    /// queries. Returns whether this start won.
+    async fn check_then_start(
+        locks: SessionStartLocks,
+        session_id: Uuid,
+        running: Arc<std::sync::Mutex<Vec<Uuid>>>,
+    ) -> bool {
+        let _guard = locks.lock(session_id).await;
+        let already_running = running.lock().unwrap().contains(&session_id);
+        tokio::time::sleep(Duration::from_millis(5)).await;
+        if already_running {
+            return false;
+        }
+        running.lock().unwrap().push(session_id);
+        true
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn competing_starts_in_one_session_admit_one_agent() {
+        let locks = SessionStartLocks::default();
+        let running = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let session_id = Uuid::new_v4();
+        let starts = (0..8)
+            .map(|_| tokio::spawn(check_then_start(locks.clone(), session_id, running.clone())))
+            .collect::<Vec<_>>();
+        let mut winners = 0;
+        for start in starts {
+            winners += usize::from(start.await.unwrap());
+        }
+        assert_eq!(winners, 1);
+        assert_eq!(running.lock().unwrap().len(), 1);
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn sessions_start_independently() {
+        let locks = SessionStartLocks::default();
+        let running = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let held = locks.lock(Uuid::new_v4()).await;
+        let other = tokio::time::timeout(
+            Duration::from_secs(5),
+            check_then_start(locks.clone(), Uuid::new_v4(), running),
+        )
+        .await
+        .expect("another session's lock must not block this one");
+        assert!(other);
+        drop(held);
+    }
+
+    #[tokio::test]
+    async fn cancelled_wait_gives_up_without_the_lock() {
+        let locks = SessionStartLocks::default();
+        let session_id = Uuid::new_v4();
+        let held = locks.lock(session_id).await;
+        let cancel = executors::executors::CancellationToken::new();
+        let waiter = {
+            let locks = locks.clone();
+            let cancel = cancel.clone();
+            tokio::spawn(async move { locks.lock_unless_cancelled(session_id, &cancel).await })
+        };
+        tokio::task::yield_now().await;
+        cancel.cancel();
+        let guard = tokio::time::timeout(Duration::from_secs(5), waiter)
+            .await
+            .expect("stop must interrupt the wait")
+            .unwrap();
+        assert!(guard.is_none());
+        drop(held);
+
+        // An already cancelled restart never takes a free lock either.
+        assert!(
+            locks
+                .lock_unless_cancelled(session_id, &cancel)
+                .await
+                .is_none()
+        );
+        let fresh = executors::executors::CancellationToken::new();
+        assert!(
+            locks
+                .lock_unless_cancelled(session_id, &fresh)
+                .await
+                .is_some()
+        );
+    }
+
+    #[tokio::test]
+    async fn waiter_shares_the_holders_lock_and_entries_are_released() {
+        let locks = SessionStartLocks::default();
+        let session_id = Uuid::new_v4();
+        let held = locks.lock(session_id).await;
+        let waiter = tokio::spawn({
+            let locks = locks.clone();
+            async move { locks.lock(session_id).await }
+        });
+        tokio::time::sleep(Duration::from_millis(20)).await;
+        assert!(
+            !waiter.is_finished(),
+            "same session must wait for the holder"
+        );
+        drop(held);
+        let guard = tokio::time::timeout(Duration::from_secs(5), waiter)
+            .await
+            .unwrap()
+            .unwrap();
+        drop(guard);
+
+        for _ in 0..10 {
+            drop(locks.lock(Uuid::new_v4()).await);
+        }
+        let _last = locks.lock(Uuid::new_v4()).await;
+        assert_eq!(locks.tracked_sessions(), 1);
+    }
 
     #[test]
     fn setup_required_entry_carries_its_own_timestamp() {

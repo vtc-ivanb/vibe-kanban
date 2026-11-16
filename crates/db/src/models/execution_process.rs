@@ -474,6 +474,26 @@ impl ExecutionProcess {
         Ok(())
     }
 
+    /// Mark a process failed only if it is still running, so a concurrent stop
+    /// is never overwritten. Returns whether the process was updated.
+    pub async fn mark_failed_if_running(
+        pool: &SqlitePool,
+        id: Uuid,
+        exit_code: Option<i64>,
+    ) -> Result<bool, sqlx::Error> {
+        let result = sqlx::query(
+            r#"UPDATE execution_processes
+               SET status = 'failed', exit_code = $1, completed_at = $2
+               WHERE id = $3 AND status = 'running'"#,
+        )
+        .bind(exit_code)
+        .bind(Utc::now())
+        .bind(id)
+        .execute(pool)
+        .await?;
+        Ok(result.rows_affected() > 0)
+    }
+
     pub fn executor_action(&self) -> Result<&ExecutorAction, anyhow::Error> {
         match &self.executor_action.0 {
             ExecutorActionField::ExecutorAction(action) => Ok(action),
@@ -697,5 +717,72 @@ impl ExecutionProcess {
         .await?;
 
         Ok(rows.into_iter().collect())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use sqlx::sqlite::SqlitePoolOptions;
+
+    use super::*;
+
+    async fn pool_with_process(id: Uuid, status: &str) -> SqlitePool {
+        let pool = SqlitePoolOptions::new()
+            .max_connections(1)
+            .connect("sqlite::memory:")
+            .await
+            .unwrap();
+        crate::run_migrations(&pool).await.unwrap();
+        sqlx::query("PRAGMA foreign_keys = OFF")
+            .execute(&pool)
+            .await
+            .unwrap();
+        sqlx::query(
+            "INSERT INTO execution_processes (id, session_id, run_reason, executor_action, status)
+             VALUES ($1, $2, 'codingagent', '{}', $3)",
+        )
+        .bind(id)
+        .bind(Uuid::new_v4())
+        .bind(status)
+        .execute(&pool)
+        .await
+        .unwrap();
+        pool
+    }
+
+    #[tokio::test]
+    async fn mark_failed_if_running_fails_running_process() {
+        let id = Uuid::new_v4();
+        let pool = pool_with_process(id, "running").await;
+
+        assert!(
+            ExecutionProcess::mark_failed_if_running(&pool, id, Some(1))
+                .await
+                .unwrap()
+        );
+        let process = ExecutionProcess::find_by_id(&pool, id)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(process.status, ExecutionProcessStatus::Failed);
+        assert_eq!(process.exit_code, Some(1));
+        assert!(process.completed_at.is_some());
+    }
+
+    #[tokio::test]
+    async fn mark_failed_if_running_keeps_a_concurrent_stop() {
+        let id = Uuid::new_v4();
+        let pool = pool_with_process(id, "killed").await;
+
+        assert!(
+            !ExecutionProcess::mark_failed_if_running(&pool, id, Some(1))
+                .await
+                .unwrap()
+        );
+        let process = ExecutionProcess::find_by_id(&pool, id)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(process.status, ExecutionProcessStatus::Killed);
     }
 }
