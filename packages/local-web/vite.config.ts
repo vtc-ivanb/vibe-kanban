@@ -108,7 +108,11 @@ export default defineConfig({
         ],
       },
     }),
-    sentryVitePlugin({ org: 'bloop-ai', project: 'vibe-kanban' }),
+    // Opt-in only: upload source maps when a token is explicitly provided, so
+    // local builds never talk to Sentry.
+    ...(process.env.SENTRY_AUTH_TOKEN
+      ? [sentryVitePlugin({ org: 'bloop-ai', project: 'vibe-kanban' })]
+      : []),
     executorSchemasPlugin(),
   ],
   resolve: {
