@@ -3,6 +3,7 @@ pub mod client;
 pub mod harness;
 pub mod normalize_logs;
 pub mod session;
+pub mod session_activity;
 
 use std::{fmt::Display, str::FromStr};
 
@@ -13,6 +14,7 @@ pub use harness::{
 pub use normalize_logs::*;
 use serde::{Deserialize, Serialize};
 pub use session::SessionManager;
+pub use session_activity::{IdleWait, SessionActivity};
 use workspace_utils::approvals::ApprovalStatus;
 
 /// Parsed event types for internal processing

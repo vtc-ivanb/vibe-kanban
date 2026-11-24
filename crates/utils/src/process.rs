@@ -117,6 +117,34 @@ pub fn is_live_descendant(pid: u32, ancestor: u32) -> bool {
     }
 }
 
+/// Whether `pid` exists and is not a zombie. Always `false` on non-unix
+/// platforms, where the check is not implemented.
+pub fn is_process_alive(pid: u32) -> bool {
+    #[cfg(unix)]
+    {
+        if pid == 0 {
+            return false;
+        }
+        let Ok(output) = std::process::Command::new("ps")
+            .args(["-o", "stat=", "-p", &pid.to_string()])
+            .output()
+        else {
+            return false;
+        };
+        if !output.status.success() {
+            return false;
+        }
+        let stat = String::from_utf8_lossy(&output.stdout);
+        let stat = stat.trim();
+        !stat.is_empty() && !stat.starts_with('Z')
+    }
+    #[cfg(not(unix))]
+    {
+        let _ = pid;
+        false
+    }
+}
+
 #[cfg(all(test, unix))]
 mod tests {
     use super::*;
@@ -136,5 +164,12 @@ mod tests {
         child.kill().unwrap();
         child.wait().unwrap();
         assert!(!is_live_descendant(pid, me));
+    }
+
+    #[test]
+    fn reports_own_process_alive() {
+        assert!(is_process_alive(std::process::id()));
+        assert!(!is_process_alive(0));
+        assert!(!is_process_alive(u32::MAX));
     }
 }

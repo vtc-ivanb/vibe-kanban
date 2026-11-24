@@ -68,3 +68,8 @@ openssl = { version = "0.10", features = ["vendored"] }
 [features]
 default = []
 qa-mode = []
+
+[dev-dependencies]
+# `start_paused` lets the Kimi retry tests run on a virtual clock.
+tokio = { workspace = true, features = ["test-util"] }
+tempfile = "3.8"

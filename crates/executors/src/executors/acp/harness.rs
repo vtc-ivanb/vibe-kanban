@@ -28,6 +28,7 @@ use workspace_utils::{
 use super::{
     AcpClient, SessionManager,
     background_tasks::{self, AfterTurn, BackgroundTaskTracker, StdoutObserver, WaitPolicy},
+    session_activity::{IdleWait, SessionActivity},
 };
 use crate::{
     approvals::ExecutorApprovalService,
@@ -43,6 +44,7 @@ pub struct AcpAgentHarness {
     mode: Option<String>,
     wait_for_background_tasks: bool,
     retry_unanswered_prompts: bool,
+    session_activity_home: Option<PathBuf>,
 }
 
 impl Default for AcpAgentHarness {
@@ -61,6 +63,7 @@ impl AcpAgentHarness {
             mode: None,
             wait_for_background_tasks: false,
             retry_unanswered_prompts: false,
+            session_activity_home: None,
         }
     }
 
@@ -72,6 +75,7 @@ impl AcpAgentHarness {
             mode: None,
             wait_for_background_tasks: false,
             retry_unanswered_prompts: false,
+            session_activity_home: None,
         }
     }
 
@@ -99,6 +103,16 @@ impl AcpAgentHarness {
     /// [`UNANSWERED_PROMPT_RETRY_DELAYS`].
     pub fn with_unanswered_prompt_retry(mut self) -> Self {
         self.retry_unanswered_prompts = true;
+        self
+    }
+
+    /// Watch the agent's own session log to wait for turns it starts by
+    /// itself (Kimi Code's background-task notifications) instead of probing
+    /// them with prompts. `home` is the agent's home directory, where the
+    /// per-session log lives. Falls back to [`UNANSWERED_PROMPT_RETRY_DELAYS`]
+    /// when the log cannot be found.
+    pub fn with_session_activity(mut self, home: impl Into<PathBuf>) -> Self {
+        self.session_activity_home = Some(home.into());
         self
     }
 
@@ -154,6 +168,7 @@ impl AcpAgentHarness {
             self.mode.clone(),
             self.wait_for_background_tasks,
             self.retry_unanswered_prompts,
+            self.session_activity_home.clone(),
             approvals,
             cancel.clone(),
         )
@@ -211,6 +226,7 @@ impl AcpAgentHarness {
             self.mode.clone(),
             self.wait_for_background_tasks,
             self.retry_unanswered_prompts,
+            self.session_activity_home.clone(),
             approvals,
             cancel.clone(),
         )
@@ -236,6 +252,7 @@ impl AcpAgentHarness {
         mode: Option<String>,
         wait_for_background_tasks: bool,
         retry_unanswered_prompts: bool,
+        session_activity_home: Option<PathBuf>,
         approvals: Option<std::sync::Arc<dyn ExecutorApprovalService>>,
         cancel: CancellationToken,
     ) -> Result<(), ExecutorError> {
@@ -493,6 +510,10 @@ impl AcpAgentHarness {
                             }
                         });
 
+                        let session_activity = session_activity_home.as_ref().map(|home| {
+                            SessionActivity::new(home.clone(), acp_session_id.clone(), cwd.clone())
+                        });
+
                         let unanswered_prompt_retry_delays: &[Duration] =
                             if retry_unanswered_prompts {
                                 &UNANSWERED_PROMPT_RETRY_DELAYS
@@ -511,6 +532,7 @@ impl AcpAgentHarness {
                             cancel: &cancel,
                             session_id: &acp_session_id,
                             background_tasks: background_tasks.as_ref(),
+                            session_activity: session_activity.as_ref(),
                             agent_pid,
                             unanswered_prompt_retry_delays,
                             restart_on_exhaustion,
@@ -562,10 +584,30 @@ struct SessionSetup {
 /// server forwards nothing from such a turn. A prompt that reaches it while
 /// that turn is starting is answered at once with `end_turn` and no session
 /// update; the automatic turn then runs unseen until the execution ends and
-/// kills it. Once that turn is running, a new prompt queues behind it and gets
-/// a turn of its own, so the request is resent after a pause.
-const UNANSWERED_PROMPT_RETRY_DELAYS: [Duration; 2] =
-    [Duration::from_secs(2), Duration::from_secs(5)];
+/// kills it. A prompt sent afterwards is queued behind that turn, also
+/// settles with an empty `end_turn`, and runs invisibly as well.
+///
+/// That automatic turn is a full agent turn: in recorded Kimi sessions its
+/// LLM steps took ~14 s at the median and 36 s at p90, and the turn reads the
+/// finished task's output before answering. Retrying after a couple of
+/// seconds therefore lands inside the turn every time (sessions restarted
+/// after 7 s routinely showed the notification turn's first request still
+/// running). Worse, every retry that lands inside the turn is itself queued
+/// as another full invisible turn, which extends the busy window.
+///
+/// The pauses below are a heuristic sized for that: the first should clear a
+/// typical one- or two-step notification turn, and the later ones leave room
+/// for the invisible turns the earlier probes queued. A turn that still
+/// outlasts them ends in a restart.
+const UNANSWERED_PROMPT_RETRY_DELAYS: [Duration; 3] = [
+    Duration::from_secs(30),
+    Duration::from_secs(120),
+    Duration::from_secs(420),
+];
+
+/// Upper bound on waiting for a hidden agent turn before treating the process
+/// as unresponsive. Only used when the agent's session log can be watched.
+const SESSION_ACTIVITY_WAIT_TIMEOUT: Duration = Duration::from_secs(20 * 60);
 
 const SILENT_TURN_RECOVERY_PROMPT: &str = "Your last turn ended after tool activity without a final response. Review the original request and latest tool results. Continue any unfinished work, resolve or explain test failures and timeouts, and provide a final response describing the outcome and any remaining blockers.";
 
@@ -631,6 +673,9 @@ struct PromptLoop<'a, A> {
     cancel: &'a CancellationToken,
     session_id: &'a str,
     background_tasks: Option<&'a BackgroundTaskTracker>,
+    /// Watches the agent's own session log for turns that ACP does not
+    /// forward (Kimi Code's background-task notifications).
+    session_activity: Option<&'a SessionActivity>,
     agent_pid: Option<u32>,
     unanswered_prompt_retry_delays: &'a [Duration],
     /// Ask for a fresh agent process, instead of failing, once the unanswered
@@ -653,6 +698,11 @@ impl<A: proto::Agent> PromptLoop<'_, A> {
         self.replay_tracker.notifications.load(Ordering::Acquire)
     }
 
+    fn agent_alive(&self) -> bool {
+        self.agent_pid
+            .is_none_or(workspace_utils::process::is_process_alive)
+    }
+
     /// Wait until every received session update has been handled. Returns
     /// false if the execution was cancelled first.
     async fn drain(&self) -> bool {
@@ -668,6 +718,9 @@ impl<A: proto::Agent> PromptLoop<'_, A> {
         let mut silent_turn_retries = 0;
         let mut unanswered_retries = 0;
         let mut pause_before_send = None;
+        // Disabled permanently if the agent's log cannot be read.
+        let mut session_activity = self.session_activity;
+        let mut activity_deadline: Option<tokio::time::Instant> = None;
 
         while let Some(req) = current_req.take() {
             if self.cancel.is_cancelled() {
@@ -744,20 +797,64 @@ impl<A: proto::Agent> PromptLoop<'_, A> {
                 current_req = Some(self.request(feedback));
             }
 
-            if turn_ended
-                && current_req.is_none()
-                && !answered
-                && let Some(&pause) = self.unanswered_prompt_retry_delays.get(unanswered_retries)
-            {
-                unanswered_retries += 1;
-                self.client.record_event(AcpEvent::Notice(
-                    "Agent ended the turn without responding, likely while starting a turn of \
-                     its own; sending the request again."
-                        .into(),
-                ));
-                pause_before_send = Some(pause);
-                current_req = Some(resend);
-                continue;
+            if turn_ended && current_req.is_none() && !answered {
+                // An empty turn is usually Kimi finishing a turn it started
+                // itself. When its session log is readable, wait for that
+                // turn instead of sending probes that would only be queued
+                // behind it as further hidden turns.
+                if let Some(activity) = session_activity
+                    && unanswered_retries < self.unanswered_prompt_retry_delays.len()
+                {
+                    match activity.is_idle().await {
+                        Some(false) => {
+                            let deadline = *activity_deadline.get_or_insert_with(|| {
+                                tokio::time::Instant::now() + SESSION_ACTIVITY_WAIT_TIMEOUT
+                            });
+                            let remaining =
+                                deadline.saturating_duration_since(tokio::time::Instant::now());
+                            self.client.record_event(AcpEvent::Notice(
+                                "Agent is still finishing a turn it started itself; waiting for it \
+                                 to finish."
+                                    .into(),
+                            ));
+                            match activity
+                                .wait_until_idle(self.cancel, remaining, || self.agent_alive())
+                                .await
+                            {
+                                IdleWait::Idle => {
+                                    unanswered_retries += 1;
+                                    self.client.record_event(AcpEvent::Notice(
+                                        "Agent finished its own turn; sending the request again."
+                                            .into(),
+                                    ));
+                                    current_req = Some(resend);
+                                    continue;
+                                }
+                                IdleWait::Cancelled => break,
+                                IdleWait::TimedOut => {
+                                    // Outlasted the wait budget: give up on
+                                    // watching and let the restart path run.
+                                    unanswered_retries = self.unanswered_prompt_retry_delays.len();
+                                }
+                                IdleWait::Unavailable => session_activity = None,
+                            }
+                        }
+                        Some(true) => {}
+                        None => session_activity = None,
+                    }
+                }
+
+                if let Some(&pause) = self.unanswered_prompt_retry_delays.get(unanswered_retries) {
+                    unanswered_retries += 1;
+                    self.client.record_event(AcpEvent::Notice(format!(
+                        "Agent ended the turn without responding, likely while finishing a turn of \
+                         its own; sending the request again in {}s.",
+                        pause.as_secs()
+                    )));
+                    pause_before_send = Some(pause);
+                    current_req = Some(resend);
+                    continue;
+                }
             }
 
             if turn_ended
@@ -821,6 +918,30 @@ impl<A: proto::Agent> PromptLoop<'_, A> {
                 && !self.client.has_final_message()
                 && silent_turn_retries < 1
             {
+                // The turn may have ended just as Kimi started a notification
+                // turn. Wait for it before injecting the recovery prompt, so
+                // the prompt is not queued invisibly behind it.
+                if let Some(activity) = session_activity
+                    && activity.is_idle().await == Some(false)
+                {
+                    let deadline = *activity_deadline.get_or_insert_with(|| {
+                        tokio::time::Instant::now() + SESSION_ACTIVITY_WAIT_TIMEOUT
+                    });
+                    let remaining = deadline.saturating_duration_since(tokio::time::Instant::now());
+                    self.client.record_event(AcpEvent::Notice(
+                        "Agent is still finishing a turn it started itself; waiting for it to \
+                         finish."
+                            .into(),
+                    ));
+                    match activity
+                        .wait_until_idle(self.cancel, remaining, || self.agent_alive())
+                        .await
+                    {
+                        IdleWait::Cancelled => break,
+                        IdleWait::Unavailable => session_activity = None,
+                        IdleWait::Idle | IdleWait::TimedOut => {}
+                    }
+                }
                 silent_turn_retries += 1;
                 self.client.record_event(AcpEvent::Notice(
                     "Agent ended without a final response; requesting completion.".into(),
@@ -1572,6 +1693,30 @@ mod tests {
         prompt: &str,
         restart_on_exhaustion: bool,
     ) -> ScriptedRun {
+        let mut turns = turns.into_iter();
+        run_agent(
+            retry_delays,
+            cancel_when_unanswered,
+            prompt,
+            restart_on_exhaustion,
+            None,
+            Duration::from_secs(10),
+            move |_| turns.next().unwrap_or_default(),
+        )
+        .await
+    }
+
+    /// Run the prompt loop against a fake agent whose response is chosen by
+    /// `respond`, keyed by the zero-based prompt index.
+    async fn run_agent(
+        retry_delays: &[Duration],
+        cancel_when_unanswered: bool,
+        prompt: &str,
+        restart_on_exhaustion: bool,
+        session_activity: Option<&SessionActivity>,
+        timeout: Duration,
+        mut respond: impl FnMut(usize) -> Vec<serde_json::Value> + 'static,
+    ) -> ScriptedRun {
         let prompt = prompt.to_string();
         use std::{cell::RefCell, rc::Rc};
 
@@ -1601,7 +1746,7 @@ mod tests {
                 let agent_handle = tokio::task::spawn_local(async move {
                     let (read, mut write) = tokio::io::split(agent_stream);
                     let mut lines = BufReader::new(read).lines();
-                    let mut turns = turns.into_iter();
+                    let mut prompt_index = 0usize;
                     while let Ok(Some(line)) = lines.next_line().await {
                         let request: serde_json::Value = serde_json::from_str(&line).unwrap();
                         if request["method"] != "session/prompt" {
@@ -1613,8 +1758,10 @@ mod tests {
                                 .unwrap()
                                 .to_string(),
                         );
+                        let updates = respond(prompt_index);
+                        prompt_index += 1;
                         let mut payload = String::new();
-                        for update in turns.next().unwrap_or_default() {
+                        for update in updates {
                             let notification = serde_json::json!({
                                 "jsonrpc": "2.0",
                                 "method": "session/update",
@@ -1665,14 +1812,14 @@ mod tests {
                     cancel: &cancel,
                     session_id: "s1",
                     background_tasks: None,
+                    session_activity,
                     agent_pid: None,
                     unanswered_prompt_retry_delays: retry_delays,
                     restart_on_exhaustion,
                 };
-                let outcome =
-                    tokio::time::timeout(Duration::from_secs(10), prompt_loop.run(prompt))
-                        .await
-                        .expect("prompt loop did not finish");
+                let outcome = tokio::time::timeout(timeout, prompt_loop.run(prompt))
+                    .await
+                    .expect("prompt loop did not finish");
 
                 // Events arrive in order, so every notice is collected once
                 // the collector reaches this sentinel.
@@ -1705,6 +1852,261 @@ mod tests {
             .await
     }
 
+    /// Fake Kimi: after the first turn ends, an automatic notification turn
+    /// runs for `notify_for`. Prompts sent while it runs are settled at once
+    /// with an empty `end_turn`, exactly like a prompt queued behind Kimi's
+    /// hidden notification turn, and each of them later runs as another
+    /// full invisible turn of `queued_turn_for`, so they extend the busy
+    /// window. Runs must be on a paused clock so the schedule is exercised
+    /// without real waiting.
+    async fn run_busy_agent(
+        retry_delays: &[Duration],
+        notify_for: Duration,
+        queued_turn_for: Duration,
+        restart_on_exhaustion: bool,
+    ) -> ScriptedRun {
+        let mut first = true;
+        let mut busy_until = tokio::time::Instant::now();
+        run_agent(
+            retry_delays,
+            false,
+            USER_PROMPT,
+            restart_on_exhaustion,
+            None,
+            Duration::from_secs(3600),
+            move |_| {
+                let now = tokio::time::Instant::now();
+                if first {
+                    first = false;
+                    busy_until = now + notify_for;
+                    task_stop_turn()
+                } else if now < busy_until {
+                    busy_until += queued_turn_for;
+                    vec![]
+                } else {
+                    vec![agent_message("Stopped the task; the analysis is complete.")]
+                }
+            },
+        )
+        .await
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn old_short_retries_fail_during_kimis_automatic_turn() {
+        // The pre-fix schedule, 2 s and 5 s. The notification turn runs for
+        // 180 s and every queued prompt behind it adds a 60 s turn, so both
+        // retries land inside the busy window and the process is declared
+        // unresponsive: the failure this change fixes.
+        let start = tokio::time::Instant::now();
+        let run = run_busy_agent(
+            &[Duration::from_secs(2), Duration::from_secs(5)],
+            Duration::from_secs(180),
+            Duration::from_secs(60),
+            false,
+        )
+        .await;
+
+        assert_eq!(run.outcome, PromptOutcome::Failed);
+        assert!(
+            start.elapsed() >= Duration::from_secs(7),
+            "retries must use the configured pauses, elapsed {:?}",
+            start.elapsed()
+        );
+        assert_eq!(run.prompts.len(), 4, "{:?}", run.prompts);
+        assert_eq!(
+            run.notices
+                .iter()
+                .filter(|notice| notice.contains(UNANSWERED_NOTICE))
+                .count(),
+            2
+        );
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn shipped_retry_schedule_recovers_from_kimis_automatic_turn() {
+        // The same 180 s notification turn plus the 60 s turns queued behind
+        // it: the 30 s and 150 s retries still collide, and the 570 s retry
+        // lands after the queue drains and is answered.
+        let start = tokio::time::Instant::now();
+        let run = run_busy_agent(
+            &UNANSWERED_PROMPT_RETRY_DELAYS,
+            Duration::from_secs(180),
+            Duration::from_secs(60),
+            false,
+        )
+        .await;
+
+        assert_eq!(run.outcome, PromptOutcome::Completed);
+        assert!(
+            start.elapsed() >= Duration::from_secs(570),
+            "retries must use the configured pauses, elapsed {:?}",
+            start.elapsed()
+        );
+        assert_eq!(run.prompts.len(), 5, "{:?}", run.prompts);
+        assert_eq!(
+            run.notices
+                .iter()
+                .filter(|notice| notice.contains(UNANSWERED_NOTICE))
+                .count(),
+            3
+        );
+        assert_eq!(run.dones, 5);
+    }
+
+    /// Create a Kimi session whose hidden turn stays open for `busy_for`.
+    async fn watched_hidden_turn(busy_for: Duration) -> (tempfile::TempDir, SessionActivity) {
+        use std::io::Write;
+
+        let temp = tempfile::tempdir().unwrap();
+        let home = temp.path().join("kimi-home");
+        let cwd = temp.path().join("worktree");
+        let session_id = "session_watch";
+        let wire = home
+            .join("sessions")
+            .join("wd_watch_1")
+            .join(session_id)
+            .join("agents/main/wire.jsonl");
+        std::fs::create_dir_all(wire.parent().unwrap()).unwrap();
+        let state = wire.parent().unwrap().parent().unwrap().parent().unwrap();
+        std::fs::write(
+            state.join("state.json"),
+            serde_json::json!({ "cwd": cwd.to_string_lossy() }).to_string(),
+        )
+        .unwrap();
+        let activity = SessionActivity::new(&home, session_id, &cwd);
+
+        let start_ms = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_millis()
+            + 1_000;
+        std::fs::write(
+            &wire,
+            serde_json::json!({"type": "turn.prompt", "turnId": 1, "time": start_ms}).to_string()
+                + "\n",
+        )
+        .unwrap();
+        let writer = wire.clone();
+        tokio::spawn(async move {
+            tokio::time::sleep(busy_for).await;
+            let mut file = std::fs::OpenOptions::new()
+                .append(true)
+                .open(writer)
+                .unwrap();
+            file.write_all(
+                (serde_json::json!({"type": "turn.ended", "turnId": 1, "time": start_ms})
+                    .to_string()
+                    + "\n")
+                    .as_bytes(),
+            )
+            .unwrap();
+        });
+        (temp, activity)
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn watcher_waits_for_kimis_hidden_turn_instead_of_probing() {
+        let (_temp, activity) = watched_hidden_turn(Duration::from_secs(6)).await;
+        let started = tokio::time::Instant::now();
+        let run = run_agent(
+            // Timed retries must not be used while the log is watchable.
+            &[Duration::from_millis(10); 3],
+            false,
+            USER_PROMPT,
+            false,
+            Some(&activity),
+            Duration::from_secs(120),
+            |index| {
+                if index == 0 {
+                    // The prompt collided with the hidden turn.
+                    vec![]
+                } else {
+                    vec![agent_message("Done")]
+                }
+            },
+        )
+        .await;
+
+        assert_eq!(run.outcome, PromptOutcome::Completed);
+        assert_eq!(run.prompts, [USER_PROMPT, USER_PROMPT]);
+        assert!(
+            started.elapsed() >= Duration::from_secs(6),
+            "must wait for the hidden turn, elapsed {:?}",
+            started.elapsed()
+        );
+        assert!(
+            run.notices
+                .iter()
+                .any(|notice| notice.contains("waiting for it to finish")),
+            "{:?}",
+            run.notices
+        );
+        assert!(
+            run.notices
+                .iter()
+                .any(|notice| notice.contains("finished its own turn")),
+            "{:?}",
+            run.notices
+        );
+        assert!(
+            !run.notices
+                .iter()
+                .any(|notice| notice.contains("sending the request again in")),
+            "the timed fallback must not run: {:?}",
+            run.notices
+        );
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn watcher_waits_before_the_silent_recovery_prompt() {
+        let (_temp, activity) = watched_hidden_turn(Duration::from_secs(6)).await;
+        let started = tokio::time::Instant::now();
+        let run = run_agent(
+            &[Duration::from_millis(10); 3],
+            false,
+            USER_PROMPT,
+            false,
+            Some(&activity),
+            Duration::from_secs(120),
+            |index| {
+                if index == 0 {
+                    task_stop_turn()
+                } else {
+                    vec![agent_message("Stopped the task; the analysis is complete.")]
+                }
+            },
+        )
+        .await;
+
+        assert_eq!(run.outcome, PromptOutcome::Completed);
+        assert_eq!(run.prompts, [USER_PROMPT, SILENT_TURN_RECOVERY_PROMPT]);
+        assert!(
+            started.elapsed() >= Duration::from_secs(6),
+            "must wait for the hidden turn, elapsed {:?}",
+            started.elapsed()
+        );
+        assert!(
+            run.notices
+                .iter()
+                .any(|notice| notice.contains("waiting for it to finish")),
+            "{:?}",
+            run.notices
+        );
+        assert!(
+            run.notices
+                .iter()
+                .any(|notice| notice.contains(SILENT_NOTICE))
+        );
+        assert!(
+            !run.notices
+                .iter()
+                .any(|notice| notice.contains("sending the request again in")),
+            "the timed fallback must not run: {:?}",
+            run.notices
+        );
+        assert_eq!(run.dones, 2);
+    }
+
     #[tokio::test]
     async fn resends_recovery_prompt_answered_by_kimi_automatic_turn() {
         let quick = [Duration::from_millis(10); 2];
@@ -1734,6 +2136,48 @@ mod tests {
         assert_eq!(run.notices.len(), 2, "{:?}", run.notices);
         assert!(run.notices[0].contains(SILENT_NOTICE));
         assert!(run.notices[1].contains(UNANSWERED_NOTICE));
+    }
+
+    #[tokio::test]
+    async fn keeps_probing_while_kimis_automatic_turn_runs_long() {
+        // A notification turn is a full agent turn, so every retry can land
+        // inside it. The loop must spend the whole schedule instead of
+        // restarting the process after the first two collisions; this case
+        // fails if the budget shrinks back to two pauses.
+        let quick = [Duration::from_millis(10); 3];
+        let run = run_scripted(
+            vec![
+                task_stop_turn(),
+                vec![],
+                vec![],
+                vec![],
+                vec![agent_message("Stopped the task; the analysis is complete.")],
+            ],
+            &quick,
+            false,
+        )
+        .await;
+
+        assert_eq!(
+            run.prompts,
+            [
+                USER_PROMPT,
+                SILENT_TURN_RECOVERY_PROMPT,
+                SILENT_TURN_RECOVERY_PROMPT,
+                SILENT_TURN_RECOVERY_PROMPT,
+                SILENT_TURN_RECOVERY_PROMPT,
+            ]
+        );
+        assert!(run.succeeded);
+        assert_eq!(run.dones, 5);
+        assert_eq!(
+            run.notices
+                .iter()
+                .filter(|notice| notice.contains(UNANSWERED_NOTICE))
+                .count(),
+            3
+        );
+        assert_eq!(run.outcome, PromptOutcome::Completed);
     }
 
     #[tokio::test]
@@ -1773,7 +2217,15 @@ mod tests {
             quick.len()
         );
         assert!(!run.succeeded, "exhaustion must fail the execution");
-        assert_eq!(UNANSWERED_PROMPT_RETRY_DELAYS.len(), 2);
+        assert_eq!(UNANSWERED_PROMPT_RETRY_DELAYS.len(), 3);
+        // Kimi's automatic turn is a full turn, so every pause must outlast a
+        // couple of LLM steps; short pauses land inside that turn again.
+        assert!(UNANSWERED_PROMPT_RETRY_DELAYS[0] >= Duration::from_secs(30));
+        // The last probe must also leave room for the invisible turns the
+        // earlier probes queued (see the paused-clock test above).
+        assert!(
+            UNANSWERED_PROMPT_RETRY_DELAYS.iter().sum::<Duration>() >= Duration::from_secs(570)
+        );
     }
 
     #[tokio::test]
